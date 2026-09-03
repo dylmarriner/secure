@@ -1,0 +1,14 @@
+[package]
+name = "secure-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+secure-core = { path = "../../../crates/secure-core" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = [] }
