@@ -22,8 +22,8 @@ fn vault_key_round_trips_through_authenticated_passphrase_envelope() {
 #[test]
 fn wrong_passphrase_cannot_open_vault_key_envelope() {
     let key = VaultKey::generate().expect("OS randomness");
-    let envelope = VaultKeyEnvelope::seal(b"right passphrase", &key, TEST_PROFILE)
-        .expect("seal key");
+    let envelope =
+        VaultKeyEnvelope::seal(b"right passphrase", &key, TEST_PROFILE).expect("seal key");
 
     assert!(envelope.open(b"wrong passphrase").is_err());
 }

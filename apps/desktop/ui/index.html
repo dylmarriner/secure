@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+    <title>Secure</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="masthead">
+        <div>
+          <p class="eyebrow">LOCAL SECURITY FOUNDATION</p>
+          <h1>Secure</h1>
+        </div>
+        <span id="stateBadge" class="badge">checking</span>
+      </header>
+
+      <section class="panel">
+        <h2>Desktop boundary online</h2>
+        <p>
+          This build exposes only lifecycle status and lock through the Tauri IPC boundary.
+          Messaging, storage and network transport are deliberately absent until their audited
+          implementations land.
+        </p>
+
+        <div class="actions">
+          <button id="refreshButton" type="button">Refresh status</button>
+          <button id="lockButton" type="button" class="danger-secondary">Lock</button>
+        </div>
+
+        <p id="message" class="message" aria-live="polite"></p>
+      </section>
+
+      <footer>
+        No analytics. No remote assets. No direct frontend networking.
+      </footer>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
