@@ -4,6 +4,10 @@ Security-first private messenger for Windows and Linux.
 
 Secure is being built around a narrow Tauri 2 UI boundary, a Rust security core, Tor-only networking, identifier-minimising messaging, encrypted local state, cryptographic destruction, and an ephemeral Ghost Session mode.
 
+## License
+
+Secure is free and open source under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later). Secure is monetized through optional hosted services (managed relays, premium capacity, business/enterprise deployments, support) rather than through the client - self-hosting is fully supported, and there is no advertising or user-data monetization. See [`docs/licensing.md`](docs/licensing.md) for how this decision governs messaging-substrate integration.
+
 ## Security posture
 
 This project does **not** claim to be untraceable, forensically invisible, or capable of guaranteed remote deletion. Its security goals are scoped to end-to-end encrypted communication, minimised identifiers, fail-closed Tor transport, encrypted application-controlled storage, and destruction of application-controlled cryptographic key material.
@@ -12,25 +16,26 @@ The repository is pre-release. Do not rely on it for high-risk communication unt
 
 ## Current foundation
 
-Implemented in the first slice:
+Implemented so far (Phases 0-2 of the roadmap; see `docs/implementation-plan.md` for the
+authoritative, continuously-updated status of each phase):
 
-- explicit application lifecycle and destruction-order state machine;
-- terminal destroyed state;
-- random 256-bit vault master key generation;
-- Argon2id passphrase-derived wrapping key;
-- versioned authenticated `SVK1` vault-key envelope;
-- XChaCha20-Poly1305 local key wrapping;
-- HKDF-SHA-256 domain-separated database/config subkeys;
-- zeroising wrappers around local key buffers;
-- minimal Tauri 2 desktop host with local-only static frontend;
-- restrictive CSP and no direct frontend network functionality;
-- CI format/test/clippy gates.
+- explicit application lifecycle and destruction-order state machine (`secure-core`);
+- random 256-bit vault master key generation, Argon2id passphrase-derived wrapping key,
+  versioned authenticated `SVK1` vault-key envelope, XChaCha20-Poly1305 local key wrapping,
+  HKDF-SHA-256 domain-separated database/config subkeys, zeroising and (for the vault master
+  key specifically) memory-locked key buffers (`secure-crypto`);
+- SQLCipher-backed encrypted vault persistence with versioned schema migrations
+  (`secure-storage`);
+- managed Tor transport embedding Arti, with a fail-closed, network-free-testable state machine
+  (`secure-transport`);
+- a Tauri 2 desktop host wiring the above into real onboarding/unlock/lock and Tor start/stop
+  flows, with a local-only static frontend, restrictive CSP, and no direct frontend network
+  functionality;
+- CI format/test/clippy gates on Linux and Windows.
 
 Not yet implemented:
 
-- SimpleX-compatible messaging integration;
-- managed Tor transport;
-- SQLCipher vault persistence;
+- SimpleX-derived messaging integration behind the `secure-messaging` adapter boundary;
 - attachment encryption/storage pipeline;
 - actual Burn Conversation / Burn Identity I/O orchestration;
 - Ghost Session storage runtime.
@@ -49,9 +54,11 @@ The security model in [`docs/security-architecture.md`](docs/security-architectu
 apps/desktop/                  Tauri desktop shell
 crates/secure-core/            lifecycle + destruction invariants
 crates/secure-crypto/          local key hierarchy
+crates/secure-storage/         encrypted vault persistence (SQLCipher)
+crates/secure-transport/       managed Tor transport (Arti)
 docs/security-architecture.md  security baseline
 docs/implementation-plan.md    phased implementation roadmap
-docs/licensing.md              messaging licensing gate
+docs/licensing.md              messaging licensing decision (AGPLv3 client)
 ```
 
 ## Core checks

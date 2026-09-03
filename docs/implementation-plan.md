@@ -407,18 +407,24 @@ All messaging traffic supported by the application is forced through the managed
 
 # Phase 3 - Messaging substrate integration
 
+**Status:** In progress
+
 ## Objective
 
 Add real asynchronous E2EE messaging without creating a custom cryptographic protocol.
 
-## Licensing gate
+## Licensing gate - resolved
 
-Before importing or linking upstream implementation code:
+Secure ships as an AGPLv3 open-source client, monetized through optional hosted services
+rather than the client itself; full decision and reasoning in `docs/licensing.md`. SimpleX
+(`simplex-chat/simplex-chat`) is confirmed AGPLv3, which is now license-compatible: its
+implementation code may be integrated directly, under the same license, where technically
+appropriate. This gate no longer blocks the phase.
 
-- resolve the SimpleX / selected substrate licensing model;
-- determine whether upstream libraries, subprocess integration, protocol compatibility or a clean adapter implementation is appropriate;
-- document resulting obligations in `docs/licensing.md`;
-- do not proceed on assumptions about AGPL or commercial licensing.
+Being licensed to link SimpleX code directly does not change the adapter boundary decision
+below - `secure-messaging` remains the only crate permitted to depend on SimpleX-derived code,
+for the architectural reasons (replaceability, small auditable AGPL-linking surface) recorded
+in `docs/licensing.md`, independent of what the license itself permits.
 
 ## Adapter boundary
 
