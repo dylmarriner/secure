@@ -17,4 +17,5 @@
 pub(crate) mod adapter;
 pub(crate) mod client;
 pub(crate) mod commands;
+pub(crate) mod events;
 pub(crate) mod protocol;

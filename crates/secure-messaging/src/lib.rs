@@ -9,13 +9,13 @@
 //! # Scope of this first slice
 //!
 //! Implemented: bootstrap (start chat + create the local user), creating and accepting
-//! one-time invitations, sending plain-text messages, and the raw chat-event stream. Not yet
-//! implemented, per the project's "no decorative implementation" rule rather than stubbed:
-//! typed event parsing (events currently surface as raw `serde_json::Value`), delivery
-//! acknowledgement, session/key rotation events, attachment transport references, and exporting
-//! protocol state into the encrypted vault (`secure-storage`). See
-//! `docs/implementation-plan.md` Phase 3 for the full adapter-boundary checklist this is
-//! working through.
+//! one-time invitations, sending plain-text messages, the raw chat-event stream, and typed
+//! parsing of the two events this crate currently understands - a plain-text message received
+//! in a direct chat, and a contact connecting - via [`parse_chat_event`]. Not yet implemented,
+//! per the project's "no decorative implementation" rule rather than stubbed: group chat, file
+//! attachments, delivery acknowledgement, session/key rotation events, and exporting protocol
+//! state into the encrypted vault (`secure-storage`). See `docs/implementation-plan.md` Phase 3
+//! for the full adapter-boundary checklist this is working through.
 //!
 //! # What has and has not actually been run
 //!
@@ -34,3 +34,13 @@ mod simplex;
 
 pub use simplex::adapter::{AdapterError, Invitation, SimplexAdapter};
 pub use simplex::client::EventReceiver;
+pub use simplex::events::{ChatEvent, ContactConnected, IncomingMessage};
+
+/// Parse one raw event value received from an [`EventReceiver`] into zero or more typed
+/// [`ChatEvent`]s - zero when the event's type is recognised but carried nothing this crate
+/// parses yet (e.g. a batch of only group messages), more than one when a single envelope
+/// batches several direct-chat text messages.
+#[must_use]
+pub fn parse_chat_event(value: serde_json::Value) -> Vec<ChatEvent> {
+    simplex::events::parse_events(value)
+}

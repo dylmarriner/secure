@@ -433,10 +433,15 @@ Create a protocol-neutral Rust interface for:
 - [x] identity/session bootstrap;
 - [x] invitation creation;
 - [x] invitation acceptance;
-- [ ] connection status (arrives as an unsolicited event, e.g. `contactConnected` -
-      `secure-messaging` currently surfaces raw events rather than a typed, queryable status);
+- [x] connection status - typed as `ChatEvent::ContactConnected { contact_id, display_name }`,
+      parsed from the `contactConnected` event via `parse_chat_event`. Push-based (arrives as
+      an event), not a synchronous per-contact query - `simplex-chat`'s API doesn't offer the
+      latter, so this is the correct shape for the underlying protocol, not a shortcut;
 - [x] message send (plain text only);
-- [ ] message receive (raw events are surfaced; not yet parsed into typed chat items);
+- [x] message receive - typed as `ChatEvent::IncomingMessage { contact_id, text }`, parsed from
+      `newChatItems` events, restricted to plain-text messages received (not sent) in a direct
+      (not group) chat. Anything else inside a `newChatItems` envelope (group messages, files,
+      reactions, sent-message echoes) is silently skipped rather than misparsed;
 - [ ] delivery acknowledgement where available;
 - [ ] session/key rotation events;
 - [ ] attachment transport references;
@@ -446,9 +451,12 @@ Create a protocol-neutral Rust interface for:
 
 The UI must not depend directly on upstream protocol-specific objects. Enforced structurally:
 `secure-messaging`'s `simplex` module is private (`mod simplex;`, not `pub mod`), so only
-`SimplexAdapter`, `Invitation`, `AdapterError` and `EventReceiver` - re-exported at the crate
-root - are visible outside this crate at all. No SimpleX-specific type can leak out even by
-accident.
+`SimplexAdapter`, `Invitation`, `AdapterError`, `EventReceiver`, `ChatEvent`,
+`IncomingMessage`/`ContactConnected` and `parse_chat_event` - re-exported at the crate root -
+are visible outside this crate at all. `ChatEvent` itself carries no SimpleX-specific field
+names or types (its `Unrecognised(serde_json::Value)` variant is the one place raw JSON survives
+past this crate's boundary, deliberately, so a caller isn't blocked on this crate parsing every
+event type before it can observe that *something* happened).
 
 ## What SimpleX integration actually means here
 
@@ -464,11 +472,14 @@ checked against `simplex-chat/simplex-chat`'s generated `bots/api/COMMANDS.md`/`
 (`stable` branch, 2026-09-04) rather than guessed; `simplex::adapter::SimplexAdapter` ties it
 together into the narrow public surface above.
 
-19 tests cover everything that does not require a live `simplex-chat` process: every command
+27 tests cover everything that does not require a live `simplex-chat` process: every command
 string is checked against the documented syntax (`simplex::commands`), the `corrId` correlation
 bookkeeping is checked including the stale-response-after-dropped-waiter case
-(`simplex::protocol`), and response-shape parsing is checked against realistic sample JSON
-matching the documented response records (`simplex::adapter`).
+(`simplex::protocol`), response-shape parsing is checked against realistic sample JSON matching
+the documented response records (`simplex::adapter`), and typed event parsing is checked
+against realistic sample JSON matching the documented event shapes, including the negative
+cases - a sent-message echo, a group message, non-text content - that must be silently skipped
+rather than misparsed as an incoming direct text message (`simplex::events`).
 
 **What has not been run:** the actual process-spawn-then-WebSocket-connect sequence and any
 real command/response round trip. Building the Haskell `simplex-chat` CLI is impractical in
