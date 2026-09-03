@@ -37,6 +37,12 @@ Not yet implemented:
 
 Those components will be added only as real tested slices rather than decorative placeholders.
 
+## Implementation roadmap
+
+The versioned engineering roadmap is in [`docs/implementation-plan.md`](docs/implementation-plan.md). It defines the implementation order, dependencies, security gates, tests and production-readiness criteria from the current foundation through encrypted storage, Tor, messaging, attachments, burn operations, Ghost Session, platform hardening and independent review.
+
+The security model in [`docs/security-architecture.md`](docs/security-architecture.md) remains authoritative. If the roadmap and security architecture ever conflict, they must be deliberately reconciled rather than silently implementing whichever document is more convenient.
+
 ## Repository map
 
 ```text
@@ -44,6 +50,7 @@ apps/desktop/                  Tauri desktop shell
 crates/secure-core/            lifecycle + destruction invariants
 crates/secure-crypto/          local key hierarchy
 docs/security-architecture.md  security baseline
+docs/implementation-plan.md    phased implementation roadmap
 docs/licensing.md              messaging licensing gate
 ```
 
@@ -61,4 +68,4 @@ Desktop host compile check on Linux:
 cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
-See `docs/security-architecture.md` for the threat model and security invariants.
+See `docs/security-architecture.md` for the threat model and security invariants, and `docs/implementation-plan.md` for the execution sequence and release gates.
