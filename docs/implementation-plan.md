@@ -62,11 +62,13 @@ Every phase below follows these rules.
 
 ## Remaining work
 
-- finish Linux Tauri compile gate;
-- add Windows Tauri compile gate;
-- add required application icons/bundle resources;
-- ensure all current CI gates pass on the PR head;
 - close any review findings before merge.
+
+All other Phase 0 remaining-work items are complete: the Linux and Windows Tauri
+compile gates both run in CI, required application icons/bundle resources exist,
+and `cargo fmt`, `cargo test --workspace --all-targets` and
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` all pass
+locally against the PR head.
 
 ## Exit criteria
 

@@ -12,8 +12,12 @@ permissions:
 
 jobs:
   rust-core:
-    name: Rust core
-    runs-on: ubuntu-latest
+    name: Rust core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -27,12 +31,15 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  desktop-check:
-    name: Tauri desktop compile check
+  desktop-check-linux:
+    name: Tauri desktop compile check (Linux)
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
       - name: Install Linux Tauri prerequisites when desktop app exists
         if: ${{ hashFiles('apps/desktop/src-tauri/Cargo.toml') != '' }}
         run: |
@@ -48,6 +55,19 @@ jobs:
             libxdo-dev \
             patchelf \
             wget
+      - name: Compile desktop host when present
+        if: ${{ hashFiles('apps/desktop/src-tauri/Cargo.toml') != '' }}
+        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+  desktop-check-windows:
+    name: Tauri desktop compile check (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
       - name: Compile desktop host when present
         if: ${{ hashFiles('apps/desktop/src-tauri/Cargo.toml') != '' }}
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml

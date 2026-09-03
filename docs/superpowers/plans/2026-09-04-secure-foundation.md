@@ -67,15 +67,17 @@
 
 **Consumes:** `secure-core::AppLifecycle`.
 
-- [ ] Add a static local-only frontend with no remote resources.
-- [ ] Add a Tauri host exposing only status and lock commands.
-- [ ] Keep all state mutation behind Rust IPC commands.
-- [ ] Add a restrictive Tauri capability configuration.
-- [ ] Add a desktop compile-check CI job with Linux Tauri prerequisites.
+- [x] Add a static local-only frontend with no remote resources.
+- [x] Add a Tauri host exposing only status and lock commands.
+- [x] Keep all state mutation behind Rust IPC commands.
+- [x] Add a restrictive Tauri capability configuration.
+- [x] Add a desktop compile-check CI job with Linux Tauri prerequisites.
+- [x] Add real application icons so the Tauri build actually produces a bundle (previously missing, blocking `tauri::generate_context!()`).
+- [x] Add a matching desktop compile-check CI job for Windows.
 
 ### Task 5: Verification and review
 
-- [ ] Run workspace tests and clippy in CI.
-- [ ] Run the desktop compile check in CI.
+- [x] Run workspace tests and clippy in CI.
+- [x] Run the desktop compile check in CI (Linux and Windows).
 - [ ] Inspect the branch diff for secrets, placeholders and accidental network functionality.
 - [ ] Open a PR to `main` with security scope and known-next-slice items documented.
