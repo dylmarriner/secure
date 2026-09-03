@@ -105,10 +105,7 @@ impl AppLifecycle {
         Ok(())
     }
 
-    pub fn apply_destruction(
-        &mut self,
-        event: DestructionEvent,
-    ) -> Result<(), LifecycleError> {
+    pub fn apply_destruction(&mut self, event: DestructionEvent) -> Result<(), LifecycleError> {
         if self.state != AppState::Destroying {
             return Err(LifecycleError::DestructionNotActive { event });
         }
@@ -122,10 +119,9 @@ impl AppLifecycle {
             (DestructionStage::UiSealed, DestructionEvent::NetworkStopped) => {
                 DestructionStage::NetworkStopped
             }
-            (
-                DestructionStage::NetworkStopped,
-                DestructionEvent::RuntimeSecretsRevoked,
-            ) => DestructionStage::RuntimeSecretsRevoked,
+            (DestructionStage::NetworkStopped, DestructionEvent::RuntimeSecretsRevoked) => {
+                DestructionStage::RuntimeSecretsRevoked
+            }
             (
                 DestructionStage::RuntimeSecretsRevoked,
                 DestructionEvent::PersistentKeyAccessDestroyed,

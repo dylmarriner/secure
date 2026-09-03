@@ -286,9 +286,7 @@ fn read_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, CryptoError> {
 }
 
 fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> Result<[u8; N], CryptoError> {
-    let end = cursor
-        .checked_add(N)
-        .ok_or(CryptoError::InvalidEnvelope)?;
+    let end = cursor.checked_add(N).ok_or(CryptoError::InvalidEnvelope)?;
     let slice = bytes
         .get(*cursor..end)
         .ok_or(CryptoError::InvalidEnvelope)?;
