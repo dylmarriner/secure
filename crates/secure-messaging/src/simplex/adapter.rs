@@ -1,0 +1,200 @@
+//! [`SimplexAdapter`]: the narrow, SimpleX-specific implementation behind
+//! [`crate::MessagingAdapter`]. See the module docs on [`super`] for the licensing/boundary
+//! context and [`super::client`] for what has and has not actually been run.
+//!
+//! This is a first slice, not full Phase 3 coverage: bootstrap (start chat + create the local
+//! user), creating and accepting one-time invitations, and sending plain-text messages. Not yet
+//! covered, deliberately left unimplemented rather than stubbed with a fake body: delivery
+//! acknowledgement, session/key rotation events, attachment transport references, and exporting
+//! protocol state into the encrypted vault. Adding a method to this file for one of those is
+//! the right way to close that gap when there is a real caller for it - see
+//! `docs/implementation-plan.md` Phase 3.
+
+use std::path::PathBuf;
+
+use thiserror::Error;
+use tokio::sync::Mutex as AsyncMutex;
+
+use super::client::{ClientError, EventReceiver, SimplexClient};
+use super::commands::{self, ChatKind};
+
+#[derive(Debug, Error)]
+pub enum AdapterError {
+    #[error(transparent)]
+    Client(#[from] ClientError),
+    #[error("simplex-chat rejected the command: {0}")]
+    CommandFailed(serde_json::Value),
+    #[error("unexpected response shape from simplex-chat: {0}")]
+    UnexpectedResponse(serde_json::Value),
+    #[error("bootstrap must complete before this operation")]
+    NotBootstrapped,
+}
+
+/// A one-time SimpleX invitation link, ready to hand to a contact out-of-band (QR code, copy,
+/// etc.) per the security architecture's "one-time invitations" contact model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invitation {
+    pub link: String,
+}
+
+pub struct SimplexAdapter {
+    client: SimplexClient,
+    /// Populated by [`Self::bootstrap`]. `simplex-chat`'s API is scoped per local user id, so
+    /// every command after bootstrap needs it.
+    user_id: AsyncMutex<Option<i64>>,
+}
+
+impl SimplexAdapter {
+    /// Launch the `simplex-chat` subprocess and connect to it. Does not bootstrap a user - call
+    /// [`Self::bootstrap`] for that.
+    pub async fn launch(
+        binary_path: PathBuf,
+        port: u16,
+        database_path: PathBuf,
+    ) -> Result<(Self, EventReceiver), AdapterError> {
+        let (client, events) = SimplexClient::launch(&binary_path, port, &database_path).await?;
+        Ok((
+            Self {
+                client,
+                user_id: AsyncMutex::new(None),
+            },
+            events,
+        ))
+    }
+
+    /// Start the chat controller and create the local user profile. Idempotent in the sense
+    /// that `simplex-chat` itself decides whether a user already exists in the given database
+    /// file; this method always issues both commands and surfaces whatever `simplex-chat`
+    /// reports.
+    pub async fn bootstrap(&self, display_name: &str) -> Result<(), AdapterError> {
+        self.run(commands::start_chat()).await?;
+        let response = self.run(commands::create_user(display_name)).await?;
+        let user_id = extract_user_id(&response)?;
+        *self.user_id.lock().await = Some(user_id);
+        Ok(())
+    }
+
+    /// Create a one-time invitation link for a new contact to connect with.
+    pub async fn create_invitation(&self) -> Result<Invitation, AdapterError> {
+        let user_id = self.require_user_id().await?;
+        let response = self.run(commands::create_invitation(user_id)).await?;
+        extract_invitation_link(&response).map(|link| Invitation { link })
+    }
+
+    /// Accept an invitation (or connect to a contact address / group link) received from
+    /// another party.
+    pub async fn accept_invitation(&self, link: &str) -> Result<(), AdapterError> {
+        let user_id = self.require_user_id().await?;
+        self.run(commands::connect_via_link(user_id, link)).await?;
+        Ok(())
+    }
+
+    /// Send a plain-text message to a direct chat.
+    pub async fn send_text_message(&self, chat_id: i64, text: &str) -> Result<(), AdapterError> {
+        self.run(commands::send_text_message(ChatKind::Direct, chat_id, text))
+            .await?;
+        Ok(())
+    }
+
+    /// Stop the underlying subprocess.
+    pub async fn shutdown(self) {
+        self.client.shutdown().await;
+    }
+
+    async fn require_user_id(&self) -> Result<i64, AdapterError> {
+        self.user_id
+            .lock()
+            .await
+            .ok_or(AdapterError::NotBootstrapped)
+    }
+
+    async fn run(&self, cmd: String) -> Result<serde_json::Value, AdapterError> {
+        let response = self.client.send_command(cmd).await?;
+        if is_error_response(&response) {
+            return Err(AdapterError::CommandFailed(response));
+        }
+        Ok(response)
+    }
+}
+
+fn is_error_response(response: &serde_json::Value) -> bool {
+    response.get("type").and_then(serde_json::Value::as_str) == Some("chatCmdError")
+}
+
+fn extract_user_id(response: &serde_json::Value) -> Result<i64, AdapterError> {
+    response
+        .get("user")
+        .and_then(|user| user.get("userId"))
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| AdapterError::UnexpectedResponse(response.clone()))
+}
+
+fn extract_invitation_link(response: &serde_json::Value) -> Result<String, AdapterError> {
+    response
+        .get("connLinkInvitation")
+        .and_then(|link| link.get("connFullLink"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| AdapterError::UnexpectedResponse(response.clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognises_a_chat_cmd_error_response() {
+        let response = serde_json::json!({
+            "type": "chatCmdError",
+            "chatError": {"type": "error", "errorType": {"type": "noActiveUser"}}
+        });
+        assert!(is_error_response(&response));
+    }
+
+    #[test]
+    fn does_not_treat_a_successful_response_as_an_error() {
+        let response = serde_json::json!({"type": "chatStarted"});
+        assert!(!is_error_response(&response));
+    }
+
+    #[test]
+    fn extracts_user_id_from_an_active_user_response() {
+        // Shape per bots/api/COMMANDS.md's CreateActiveUser -> ActiveUser response and
+        // bots/api/TYPES.md's User record (only the field this crate actually reads is
+        // populated here; the real response carries many more).
+        let response = serde_json::json!({
+            "type": "activeUser",
+            "user": {"userId": 1, "localDisplayName": "secure-user"}
+        });
+        assert_eq!(extract_user_id(&response).expect("user id"), 1);
+    }
+
+    #[test]
+    fn extract_user_id_rejects_a_response_missing_the_field() {
+        let response = serde_json::json!({"type": "chatStarted"});
+        assert!(extract_user_id(&response).is_err());
+    }
+
+    #[test]
+    fn extracts_invitation_link_from_an_invitation_response() {
+        // Shape per bots/api/COMMANDS.md's APIAddContact -> Invitation response and
+        // bots/api/TYPES.md's CreatedConnLink record.
+        let response = serde_json::json!({
+            "type": "invitation",
+            "user": {"userId": 1},
+            "connLinkInvitation": {
+                "connFullLink": "https://simplex.chat/invitation#/?v=1&smp=...",
+                "connShortLink": null
+            },
+            "connection": {}
+        });
+        let invitation = extract_invitation_link(&response).expect("invitation link");
+        assert_eq!(invitation, "https://simplex.chat/invitation#/?v=1&smp=...");
+    }
+
+    #[test]
+    fn extract_invitation_link_rejects_a_response_missing_the_field() {
+        let response = serde_json::json!({"type": "chatStarted"});
+        assert!(extract_invitation_link(&response).is_err());
+    }
+}

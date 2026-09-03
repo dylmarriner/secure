@@ -430,37 +430,83 @@ in `docs/licensing.md`, independent of what the license itself permits.
 
 Create a protocol-neutral Rust interface for:
 
-- identity/session bootstrap;
-- invitation creation;
-- invitation acceptance;
-- connection status;
-- message send;
-- message receive;
-- delivery acknowledgement where available;
-- session/key rotation events;
-- attachment transport references;
-- disconnect / conversation destruction;
-- protocol state export into the encrypted vault.
+- [x] identity/session bootstrap;
+- [x] invitation creation;
+- [x] invitation acceptance;
+- [ ] connection status (arrives as an unsolicited event, e.g. `contactConnected` -
+      `secure-messaging` currently surfaces raw events rather than a typed, queryable status);
+- [x] message send (plain text only);
+- [ ] message receive (raw events are surfaced; not yet parsed into typed chat items);
+- [ ] delivery acknowledgement where available;
+- [ ] session/key rotation events;
+- [ ] attachment transport references;
+- [ ] disconnect / conversation destruction (`SimplexAdapter::shutdown` stops the whole
+      subprocess, which is disconnect-everything, not a per-conversation operation);
+- [ ] protocol state export into the encrypted vault.
 
-The UI must not depend directly on upstream protocol-specific objects.
+The UI must not depend directly on upstream protocol-specific objects. Enforced structurally:
+`secure-messaging`'s `simplex` module is private (`mod simplex;`, not `pub mod`), so only
+`SimplexAdapter`, `Invitation`, `AdapterError` and `EventReceiver` - re-exported at the crate
+root - are visible outside this crate at all. No SimpleX-specific type can leak out even by
+accident.
+
+## What SimpleX integration actually means here
+
+SimpleX Chat's implementation is Haskell, not Rust - there is no Rust library to `cargo`-link,
+regardless of the licensing decision. The documented integration path for any non-Haskell
+client is running the `simplex-chat` CLI as a local subprocess with `-p <port>`, which then
+serves a JSON-over-WebSocket API (`simplex-chat`'s own `bots/README.md`). `secure-messaging`
+implements exactly that: `simplex::client::SimplexClient` spawns the subprocess and speaks the
+documented `{"corrId", "cmd"}` / `{"corrId", "resp"}` correlation protocol over the WebSocket;
+`simplex::commands` builds the exact command strings (`/_start`, `/_create user <json>`,
+`/_address`/`/_connect` for addresses/invitations, `/_send ... json ...` for messages), each
+checked against `simplex-chat/simplex-chat`'s generated `bots/api/COMMANDS.md`/`TYPES.md`
+(`stable` branch, 2026-09-04) rather than guessed; `simplex::adapter::SimplexAdapter` ties it
+together into the narrow public surface above.
+
+19 tests cover everything that does not require a live `simplex-chat` process: every command
+string is checked against the documented syntax (`simplex::commands`), the `corrId` correlation
+bookkeeping is checked including the stale-response-after-dropped-waiter case
+(`simplex::protocol`), and response-shape parsing is checked against realistic sample JSON
+matching the documented response records (`simplex::adapter`).
+
+**What has not been run:** the actual process-spawn-then-WebSocket-connect sequence and any
+real command/response round trip. Building the Haskell `simplex-chat` CLI is impractical in
+this development environment (no Haskell toolchain; building GHC/cabal dependencies from
+scratch is a multi-hour undertaking even with network access). This is the same category of gap
+as `secure-transport`'s unexercised live Tor bootstrap: type-correct and protocol-correct as
+far as this environment allows, confirmed against upstream's own generated API reference rather
+than assumed, but not yet empirically run. Verifying this against a real `simplex-chat` binary
+on a machine that can build or install one is the natural next step before this phase can be
+called done, and before `secure-messaging` is wired into the Tauri host the way
+`secure-storage`/`secure-crypto`/`secure-transport` were.
 
 ## Contact model
 
-- one-time invitations and QR representation;
-- local aliases only;
-- no searchable global directory;
-- safety-code / fingerprint verification;
-- explicit contact verification state;
-- no automatic contact discovery from phone/email/address books.
+- [x] one-time invitations - `SimplexAdapter::create_invitation`/`accept_invitation`;
+- [ ] QR representation (UI work, not yet done);
+- [ ] local aliases (no vault integration yet - `secure-messaging` has no dependency on
+      `secure-storage`);
+- no searchable global directory: by construction, since only one-time invitations are
+  implemented (no `/_address` long-term-address command is wired up);
+- [ ] safety-code / fingerprint verification;
+- [ ] explicit contact verification state;
+- no automatic contact discovery from phone/email/address books: true by omission, nothing in
+  this crate reads a phone/email/address book.
 
 ## Tests
 
-- two fresh test clients can establish contact using an invitation;
-- messages survive offline recipient delivery where supported;
-- relay compromise does not expose message plaintext under the selected protocol's model;
-- malformed protocol events cannot corrupt the vault lifecycle;
-- adapter restart restores required encrypted session state;
-- contact removal and burn behaviour are deterministic.
+- two fresh test clients can establish contact using an invitation - **not yet run**, needs a
+  real `simplex-chat` process (see above);
+- messages survive offline recipient delivery where supported - not yet run, same reason;
+- relay compromise does not expose message plaintext under the selected protocol's model - not
+  yet run, same reason; also not really this crate's test to write, since SimpleX's own
+  end-to-end encryption is what provides this property, not code in `secure-messaging`;
+- malformed protocol events cannot corrupt the vault lifecycle - not yet applicable, since
+  `secure-messaging` has no vault integration yet (see "protocol state export" above);
+- adapter restart restores required encrypted session state - not yet applicable, same reason;
+- contact removal and burn behaviour are deterministic - not yet applicable, this is Phase 5/6
+  territory.
 
 ## Exit criteria
 
