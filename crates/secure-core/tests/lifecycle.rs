@@ -18,6 +18,19 @@ fn destroyed_state_is_terminal() {
 }
 
 #[test]
+fn constructing_destroying_state_preserves_destruction_invariant() {
+    let mut lifecycle = AppLifecycle::new(AppState::Destroying);
+
+    assert_eq!(
+        lifecycle.destruction_stage(),
+        Some(DestructionStage::Armed)
+    );
+    lifecycle
+        .apply_destruction(DestructionEvent::UiSealed)
+        .expect("destroying state must have an active stage");
+}
+
+#[test]
 fn identity_burn_cannot_clean_data_before_key_access_is_destroyed() {
     let mut lifecycle = AppLifecycle::new(AppState::Unlocked);
     lifecycle
