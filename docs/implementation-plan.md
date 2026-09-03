@@ -84,6 +84,8 @@ locally against the PR head.
 
 # Phase 1 - Encrypted vault persistence
 
+**Status:** In progress
+
 ## Objective
 
 Replace in-memory-only security state with an encrypted application vault without allowing plaintext persistence paths to appear as implementation shortcuts.
@@ -122,15 +124,66 @@ Store encrypted records for:
 - wipe transient key buffers where practical;
 - investigate memory locking independently on Windows and Linux and document limitations.
 
-## Tests
+## Implemented (`crates/secure-storage`)
 
-- wrong passphrase cannot produce a usable vault key;
-- tampered key envelope fails authentication;
-- wrong database key cannot open the vault;
-- plaintext message content cannot be found in application-controlled storage after close;
-- migrations preserve encrypted state;
-- interrupted migrations either roll back safely or resume from a documented state;
-- app cannot accidentally create a new plaintext database when encrypted open fails.
+- `Vault::create_new` / `Vault::open_existing` over `rusqlite` with the
+  `bundled-sqlcipher-vendored-openssl` feature (SQLCipher 4, vendored OpenSSL - no system
+  SQLCipher/OpenSSL dependency);
+- database key is `VaultKey::derive_subkey(SubkeyPurpose::DatabaseV1)`, passed to SQLCipher via
+  raw-key syntax (`PRAGMA key = "x'...'"`) rather than re-deriving through SQLCipher's own
+  PBKDF2, since the input is already a uniformly random 256-bit key;
+- key material is force-validated immediately after keying the connection (`verify_key`, a
+  `SELECT` against `sqlite_master`) before any pragma or migration work runs, so a wrong key or
+  tampered file is reported as `StorageError::WrongKeyOrCorrupt` rather than a confusing
+  downstream SQLite error;
+- `create_new` refuses to touch a path that already exists (file or directory) and deletes any
+  half-initialised file it created itself if key derivation/validation/migration fails partway
+  through, so a failed create never leaves a file that looks like a usable - or plaintext -
+  vault;
+- `open_existing` never creates a file and never deletes an existing one, even on failure;
+- schema versioning via `PRAGMA user_version` with an explicit, ordered `Migration` list; each
+  migration runs inside a SQL transaction, so a crash mid-migration cannot leave the schema at
+  a version between two known states; opening a vault whose stored version is newer than the
+  build supports fails closed (`SchemaTooNew`) instead of guessing;
+- baseline defensive pragmas: `foreign_keys = ON`, `secure_delete = ON`, `trusted_schema = OFF`;
+  journal mode is left at the default rollback journal (not WAL) deliberately, to keep the
+  vault as a single on-disk file rather than adding `-wal`/`-shm` sidecars that destruction
+  cleanup would also have to find and remove;
+- initial schema (`migrations/0001_initial_schema.sql`) covering local identity metadata,
+  contacts, invitations, protocol adapter state, conversations, messages, drafts, attachment
+  metadata/keys, app config and destruction tombstones, exactly as scoped below. All record ids
+  are random 128-bit opaque tokens rather than sequential integers.
+
+## Tests (passing)
+
+- wrong database key cannot open the vault (`wrong_key_cannot_open_vault`);
+- tampered ciphertext fails authentication (`tampered_file_fails_authentication`);
+- app cannot accidentally create/overwrite a database when a path already exists, file or
+  directory (`create_new_rejects_existing_path`,
+  `create_new_refuses_to_touch_a_pre_existing_directory`);
+- app cannot accidentally leave a usable-looking file behind after a failed open
+  (`failed_migration_does_not_leave_a_file_behind`);
+- opening a missing vault fails closed rather than creating one (`open_existing_rejects_missing_path`);
+- correct key round-trips create -> close -> reopen (`round_trips_with_correct_key`);
+- plaintext message content inserted through the schema layer cannot be found anywhere in the
+  raw on-disk file after the vault is closed (`no_application_controlled_plaintext_message_persistence`).
+
+`wrong passphrase cannot produce a usable vault key` is already covered in
+`crates/secure-crypto` (Phase 0), one layer below this crate.
+
+## Remaining work
+
+- migrations preserving encrypted state across a real version bump has no test yet, because
+  only one migration (`0001`) exists; add a regression test the day a `0002` migration lands;
+- interrupted-migration crash-consistency is currently a design property (each migration step
+  is one SQL transaction) rather than something proven by a fault-injection test; add one;
+- investigate memory locking for the derived database key independently on Windows and Linux,
+  per the key-handling requirement below, and document the result;
+- wire `secure-storage` into the Tauri host / `secure-core` lifecycle (currently a standalone,
+  tested crate with no application-level caller yet - by design, per the "no decorative
+  implementation" engineering rule, until there is a real onboarding/unlock flow to drive it);
+- typed read/write record APIs beyond the test-only insert helpers in `schema.rs` belong to
+  whichever later-phase crate (messaging, attachments) actually needs to persist that data.
 
 ## Exit criteria
 

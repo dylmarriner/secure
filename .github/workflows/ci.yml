@@ -24,6 +24,9 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install NASM (Windows, required to build vendored OpenSSL for SQLCipher)
+        if: ${{ runner.os == 'Windows' }}
+        uses: ilammy/setup-nasm@v1
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
