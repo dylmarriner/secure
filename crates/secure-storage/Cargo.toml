@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 rand_core.workspace = true
-rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+rusqlite = { version = "0.36", features = ["bundled-sqlcipher-vendored-openssl"] }
 secure-crypto = { path = "../secure-crypto" }
 thiserror.workspace = true
 zeroize.workspace = true

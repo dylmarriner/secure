@@ -4,6 +4,7 @@ members = [
     "crates/secure-core",
     "crates/secure-crypto",
     "crates/secure-storage",
+    "crates/secure-transport",
 ]
 exclude = ["apps/desktop/src-tauri"]
 

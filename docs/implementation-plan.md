@@ -271,31 +271,108 @@ A clean install can create, lock, unlock, close and reopen an encrypted vault on
 
 # Phase 2 - Managed Tor transport
 
+**Status:** In progress
+
 ## Objective
 
 Make network access security-enforcing rather than advisory.
 
 ## Work
 
-- choose supported Tor integration strategy: managed bundled Tor process, Arti, or another mature implementation after platform review;
-- start and supervise Tor from Rust;
-- expose only narrowly scoped local proxy access to the messaging layer;
-- prohibit WebView direct networking;
-- prohibit direct DNS resolution for messaging destinations;
-- implement bootstrap state, failure state and retry policy;
-- implement strict-mode network state machine;
-- ensure transport errors never fall back to clearnet;
-- isolate unrelated circuits/transports where useful and supported;
-- implement shutdown sequencing so sensitive network activity stops before lock/burn cleanup.
+- ~~choose supported Tor integration strategy~~ - **decided: Arti**, the Tor Project's own
+  pure-Rust implementation (`arti-client` 0.46), embedded directly rather than bundling and
+  supervising the reference C `tor` daemon as a subprocess. No platform binary to package/sign,
+  no subprocess lifecycle to supervise, no local SOCKS port; `TorClient::connect` is called
+  in-process;
+- start and supervise Tor from Rust - `TorTransport::start` calls
+  `TorClient::create_bootstrapped`;
+- expose only narrowly scoped access to the messaging layer - `TorTransport::connect` is the
+  *only* network entry point `secure-transport` exposes; there is no other function anywhere in
+  the crate that performs network I/O;
+- prohibit WebView direct networking - unchanged from Phase 0 (`connect-src 'none'` CSP; no
+  networking capability granted to the WebView);
+- prohibit direct DNS resolution for messaging destinations - `connect` only accepts
+  `(host, port)` via `arti_client::IntoTorAddr`, never `DangerouslyIntoTorAddr`'s raw-IP
+  variants, so a caller cannot bypass Tor-side name resolution;
+- implement bootstrap state, failure state and retry policy - see `TransportState` below;
+- implement strict-mode network state machine - see `TransportLifecycle` below;
+- ensure transport errors never fall back to clearnet - structural, not a runtime check: this
+  crate contains no other network path to fall back to;
+- shutdown sequencing so sensitive network activity stops before lock/burn cleanup -
+  `TorTransport::stop` transitions to the terminal `Stopped` state synchronously, so every
+  `connect` call after `stop` returns refuses immediately, before this crate's caller goes on
+  to run any lock/burn cleanup.
 
-## Tests
+**Not yet done:** isolating unrelated circuits per-conversation
+(`TorClient::isolated_client`/`IsolationToken` exist in the `arti-client` API and are a natural
+fit for one isolation token per contact) has no caller yet, because there is no messaging layer
+above this crate yet to decide the isolation boundary. Wiring `secure-transport` into the Tauri
+host, the way `secure-storage`/`secure-crypto` were wired in Phase 1, is also not done yet -
+this phase currently ships a real, tested, standalone crate, the same shape Phase 1's storage
+work was in before it got wired up.
 
-- strict mode refuses messaging before Tor readiness;
-- Tor process death immediately disables messaging transport;
+## Implemented (`crates/secure-transport`)
+
+- `TransportLifecycle` (`src/lifecycle.rs`): a pure, network-free state machine -
+  `NotStarted -> Bootstrapping -> Ready`, `Bootstrapping -> Failed` (with `Failed -> Bootstrapping`
+  allowed as the retry path), and `Stop` reachable from every non-terminal state into the
+  terminal `Stopped`. `can_connect()` is `true` in exactly one state (`Ready`) and is the single
+  enforcement point behind strict mode and "no clearnet fallback". Modelled the same way
+  `secure_core::AppLifecycle` separates lifecycle bookkeeping from I/O, specifically so it can
+  be fully unit-tested without a live Tor bootstrap;
+- `TorTransport` (`src/lib.rs`): wraps `Arc<TorClient<PreferredRuntime>>` and one
+  `TransportLifecycle` behind a `Mutex`. `new` builds config via
+  `TorClientConfigBuilder::from_directories` (separate state/cache directories, matching the
+  vault's own separation of concerns); `start` bootstraps and drives the lifecycle; `connect`
+  checks `can_connect()` before doing anything else and refuses with no network I/O attempted
+  if the transport isn't `Ready`; `stop` is terminal and synchronous from the caller's
+  perspective - it does not await Arti's own background task teardown, only guarantees that no
+  *new* connection can be initiated once it returns, which is the actual security property
+  shutdown sequencing needs;
+- `bootstrap_fraction()` exposes `TorClient::bootstrap_status().as_frac()` for a future status
+  indicator; nothing in this crate uses it to decide whether to allow a connection - that
+  decision belongs to `TransportLifecycle::can_connect()` alone.
+
+## What has and has not actually been run
+
+The `TransportLifecycle` state machine is unit-tested (10 tests, network-free). The real Arti
+integration - `TorTransport::new`/`start`/`connect` actually talking to `arti-client` - compiles
+and type-checks against the real 0.46 API (verified against that crate's source directly, not
+just docs.rs summaries, after two rounds of real compiler errors: `TorClient<R>` has no default
+runtime parameter, so `PreferredRuntime` must be named explicitly from `tor_rtcompat`; and
+`TorClientConfigBuilder::from_directories` is an associated function, not a builder method).
+**It has not been run against the live Tor network or exercised a real bootstrap.** This
+development environment has no outbound network access, so that verification is still
+outstanding on a machine that has one - this is analogous to the Windows `mlock` gap from
+Phase 1: type-correct and cross-checked as far as this environment allows, not yet empirically
+run.
+
+## A known upstream risk, documented rather than hidden
+
+`arti-client`'s own documentation for `TorClient::create_bootstrapped` states that Arti can call
+`process::exit(1)` and terminate the whole process if the Tor network consensus marks the
+running Arti version as obsolete. That is "fail catastrophic", not "fail closed" - this crate
+cannot intercept or downgrade that behaviour from the outside, since it happens inside Arti's
+own code. This must be re-checked against upstream's plans to change it before Secure is
+described as production-ready; it is not something a message-layer retry policy can work around.
+
+## A real dependency conflict this phase surfaced
+
+`arti-client`'s directory-cache manager (`tor-dirmgr`) also depends on `rusqlite`, and Cargo
+only permits one crate in the dependency graph to link the native `sqlite3` library
+(`links = "sqlite3"`). `secure-storage`'s `rusqlite` was bumped from 0.32 to 0.36 to satisfy
+`tor-dirmgr`'s `>=0.36.0, <0.40.0` requirement; 0.36 still carries the
+`bundled-sqlcipher-vendored-openssl` feature `secure-storage` depends on, so this was a
+version bump, not a design change. All `secure-storage` tests still pass unmodified.
+
+## Tests (remaining, network-dependent - not yet written)
+
+- Tor process/task death immediately disables messaging transport (this environment cannot
+  induce a real bootstrap to then kill);
 - DNS leakage tests for supported network paths;
-- explicit tests proving no clearnet fallback;
-- restart recovery tests;
-- firewall/proxy integration tests where practical in CI or dedicated integration runners.
+- restart recovery tests against a real persisted state/cache directory;
+- firewall/proxy integration tests, practical only in CI or a dedicated integration runner with
+  real network access.
 
 ## Exit criteria
 

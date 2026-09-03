@@ -1,0 +1,15 @@
+[package]
+name = "secure-transport"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls"] }
+thiserror.workspace = true
+tor-rtcompat = { version = "0.46", features = ["tokio", "rustls"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
