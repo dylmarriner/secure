@@ -12,12 +12,15 @@ use std::sync::Mutex;
 use secure_core::{AppEvent, AppLifecycle, AppState};
 use secure_crypto::{Argon2Profile, VaultKey, VaultKeyEnvelope};
 use secure_storage::Vault;
+use secure_transport::{TorTransport, TransportState};
 use serde::Serialize;
 use tauri::{Manager, State};
 use zeroize::Zeroizing;
 
 const ENVELOPE_FILE_NAME: &str = "vault.key";
 const DATABASE_FILE_NAME: &str = "vault.db";
+const TOR_STATE_DIR_NAME: &str = "tor/state";
+const TOR_CACHE_DIR_NAME: &str = "tor/cache";
 
 /// Passphrases below this length are rejected during onboarding. This is a floor, not a
 /// strength meter: it exists to stop trivially short input, not to replace the Argon2id
@@ -60,10 +63,20 @@ struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     paths: VaultPaths,
     unlocked: Mutex<Option<UnlockedVault>>,
+    /// Managed Tor transport. Constructing it never performs network I/O (it only builds
+    /// config and directory paths); bootstrapping is a separate, explicit step triggered by
+    /// the `start_tor` command, not something onboarding/unlock does implicitly. There is no
+    /// messaging layer yet to decide *when* Tor should be required, so this deliberately does
+    /// not interlock with vault lock/unlock - see `docs/implementation-plan.md` Phase 2.
+    transport: TorTransport,
 }
 
 impl AppRuntime {
-    fn new(paths: VaultPaths) -> Self {
+    fn new(
+        paths: VaultPaths,
+        tor_state_dir: PathBuf,
+        tor_cache_dir: PathBuf,
+    ) -> Result<Self, String> {
         let mut lifecycle = AppLifecycle::new(AppState::Starting);
         let startup_event = if paths.vault_exists() {
             AppEvent::ExistingVault
@@ -74,17 +87,43 @@ impl AppRuntime {
             .apply(startup_event)
             .expect("Starting always accepts ExistingVault/NeedsOnboarding");
 
-        Self {
+        let transport = TorTransport::new(&tor_state_dir, &tor_cache_dir)
+            .map_err(|error| format!("failed to configure Tor transport: {error}"))?;
+
+        Ok(Self {
             lifecycle: Mutex::new(lifecycle),
             paths,
             unlocked: Mutex::new(None),
-        }
+            transport,
+        })
     }
 }
 
 #[derive(Debug, Serialize)]
 struct AppStatus {
     state: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct TorStatus {
+    state: &'static str,
+    /// `0.0`-`1.0` bootstrap progress once a bootstrap attempt has been made; `null` before
+    /// the first attempt. Purely informational - nothing in the application uses this to
+    /// decide whether a connection may be attempted.
+    bootstrap_fraction: Option<f32>,
+}
+
+fn tor_status_for(transport: &TorTransport) -> TorStatus {
+    TorStatus {
+        state: match transport.state() {
+            TransportState::NotStarted => "not_started",
+            TransportState::Bootstrapping => "bootstrapping",
+            TransportState::Ready => "ready",
+            TransportState::Failed => "failed",
+            TransportState::Stopped => "stopped",
+        },
+        bootstrap_fraction: transport.bootstrap_fraction(),
+    }
 }
 
 fn status_for(state: AppState) -> AppStatus {
@@ -259,9 +298,54 @@ fn lock_application_impl(runtime: &AppRuntime) -> Result<AppStatus, String> {
     Ok(status_for(lifecycle.state()))
 }
 
+fn tor_status_impl(runtime: &AppRuntime) -> TorStatus {
+    tor_status_for(&runtime.transport)
+}
+
+/// Bootstrap the managed Tor transport. Idempotent in the sense that calling it again from
+/// `Ready` is simply refused by the underlying lifecycle (`start` only accepts `NotStarted` or
+/// `Failed`); calling it again from `Failed` retries, which is the intended retry policy.
+async fn start_tor_impl(runtime: &AppRuntime) -> Result<TorStatus, String> {
+    runtime
+        .transport
+        .start()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(tor_status_for(&runtime.transport))
+}
+
+/// Stop the managed Tor transport. Idempotent: stopping an already-`Stopped` transport is a
+/// no-op success rather than surfacing the underlying lifecycle's "invalid transition" error,
+/// matching `lock_application`'s idempotency for the same reason - a caller asking to stop
+/// something that is already stopped is not an error condition.
+fn stop_tor_impl(runtime: &AppRuntime) -> Result<TorStatus, String> {
+    if runtime.transport.state() != TransportState::Stopped {
+        runtime
+            .transport
+            .stop()
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(tor_status_for(&runtime.transport))
+}
+
 #[tauri::command]
 fn app_status(runtime: State<'_, AppRuntime>) -> Result<AppStatus, String> {
     app_status_impl(&runtime)
+}
+
+#[tauri::command]
+fn tor_status(runtime: State<'_, AppRuntime>) -> TorStatus {
+    tor_status_impl(&runtime)
+}
+
+#[tauri::command]
+async fn start_tor(runtime: State<'_, AppRuntime>) -> Result<TorStatus, String> {
+    start_tor_impl(&runtime).await
+}
+
+#[tauri::command]
+fn stop_tor(runtime: State<'_, AppRuntime>) -> Result<TorStatus, String> {
+    stop_tor_impl(&runtime)
 }
 
 #[tauri::command]
@@ -294,14 +378,26 @@ fn main() {
                 .expect("application data directory must be resolvable");
             fs::create_dir_all(&app_data_dir)
                 .expect("failed to create the application data directory");
-            app.manage(AppRuntime::new(VaultPaths::new(app_data_dir)));
+
+            let tor_state_dir = app_data_dir.join(TOR_STATE_DIR_NAME);
+            let tor_cache_dir = app_data_dir.join(TOR_CACHE_DIR_NAME);
+            fs::create_dir_all(&tor_state_dir).expect("failed to create the Tor state directory");
+            fs::create_dir_all(&tor_cache_dir).expect("failed to create the Tor cache directory");
+
+            let runtime =
+                AppRuntime::new(VaultPaths::new(app_data_dir), tor_state_dir, tor_cache_dir)
+                    .expect("failed to construct application runtime");
+            app.manage(runtime);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             app_status,
             complete_onboarding,
             unlock_application,
-            lock_application
+            lock_application,
+            tor_status,
+            start_tor,
+            stop_tor
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Secure desktop application");
@@ -314,7 +410,12 @@ mod tests {
     const PASSPHRASE: &str = "correct horse battery staple";
 
     fn runtime_in(dir: &std::path::Path) -> AppRuntime {
-        AppRuntime::new(VaultPaths::new(dir.to_path_buf()))
+        AppRuntime::new(
+            VaultPaths::new(dir.to_path_buf()),
+            dir.join("tor-state"),
+            dir.join("tor-cache"),
+        )
+        .expect("build test runtime")
     }
 
     #[test]
@@ -421,7 +522,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let paths = VaultPaths::new(dir.path().to_path_buf());
         std::fs::create_dir_all(&paths.database).expect("pre-create database path as directory");
-        let runtime = AppRuntime::new(VaultPaths::new(dir.path().to_path_buf()));
+        let runtime = runtime_in(dir.path());
 
         let error = complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime)
             .expect_err("database creation must fail");
@@ -430,5 +531,51 @@ mod tests {
             !runtime.paths.envelope.exists(),
             "the orphaned envelope must be cleaned up after a failed onboarding"
         );
+    }
+
+    // Real Tor bootstrap requires outbound network access this environment does not have, so
+    // start_tor's success path is not exercised here. What is tested is the wiring that does
+    // not require a network: constructing the transport, its initial status, and stop's
+    // idempotent no-network refusal path.
+
+    #[test]
+    fn tor_status_before_any_start_is_not_started_with_no_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+
+        let status = tor_status_impl(&runtime);
+        assert_eq!(status.state, "not_started");
+        assert_eq!(status.bootstrap_fraction, None);
+    }
+
+    #[test]
+    fn stop_tor_before_start_transitions_to_stopped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+
+        let status = stop_tor_impl(&runtime).expect("stop before start");
+        assert_eq!(status.state, "stopped");
+    }
+
+    #[test]
+    fn stop_tor_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+
+        stop_tor_impl(&runtime).expect("first stop");
+        let status = stop_tor_impl(&runtime).expect("second stop must not error");
+        assert_eq!(status.state, "stopped");
+    }
+
+    #[tokio::test]
+    async fn start_tor_after_stop_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+
+        stop_tor_impl(&runtime).expect("stop");
+        let error = start_tor_impl(&runtime)
+            .await
+            .expect_err("cannot restart a stopped transport");
+        assert!(error.contains("Stopped"));
     }
 }

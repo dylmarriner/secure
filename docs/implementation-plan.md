@@ -306,10 +306,35 @@ Make network access security-enforcing rather than advisory.
 **Not yet done:** isolating unrelated circuits per-conversation
 (`TorClient::isolated_client`/`IsolationToken` exist in the `arti-client` API and are a natural
 fit for one isolation token per contact) has no caller yet, because there is no messaging layer
-above this crate yet to decide the isolation boundary. Wiring `secure-transport` into the Tauri
-host, the way `secure-storage`/`secure-crypto` were wired in Phase 1, is also not done yet -
-this phase currently ships a real, tested, standalone crate, the same shape Phase 1's storage
-work was in before it got wired up.
+above this crate yet to decide the isolation boundary.
+
+## Wired into the Tauri host (`apps/desktop/src-tauri`)
+
+`AppRuntime` now owns a `TorTransport`, constructed at startup against
+`<app_data_dir>/tor/state` and `<app_data_dir>/tor/cache` (separate from the vault's own
+directories, matching the same separation-of-concerns the vault key/database split already
+uses). Construction never performs network I/O; three commands drive the rest explicitly:
+
+- `tor_status`: current `TransportState` plus `bootstrap_fraction()`, purely informational;
+- `start_tor`: bootstraps. Async, since `TorClient::create_bootstrapped` is async and must run
+  inside a Tokio context - Tauri provides one, so this did not require adding a runtime;
+- `stop_tor`: terminal, idempotent (stopping an already-`Stopped` transport is a no-op success,
+  matching `lock_application`'s existing idempotency for the same reason).
+
+Deliberately **not** wired: there is no interlock between vault lock/unlock and Tor start/stop.
+Locking the vault does not stop Tor, and unlocking does not start it. The security architecture
+document's Lock semantics say to "stop sensitive networking", but with no messaging layer yet
+there is no sensitive networking happening to stop, and guessing at that interlock's exact
+shape now - before Phase 3 exists to define what "sensitive" means here - would be encoding an
+assumption rather than a decision. This is intentionally deferred to Phase 3, not forgotten.
+
+12 desktop-host tests now pass (up from 8): the four new ones cover `tor_status` before any
+start, `stop_tor` before start (transitions to `Stopped`), `stop_tor` twice (idempotent), and
+`start_tor` after `stop_tor` (refused - the lifecycle rejects `Start` from the terminal
+`Stopped` state before any network call is attempted, so this is testable without network
+access). The frontend (`apps/desktop/ui`) gained a Tor status badge and start/stop buttons on
+the unlocked panel; like the rest of this phase, this has not been visually verified in a real
+window since this environment has no display.
 
 ## Implemented (`crates/secure-transport`)
 

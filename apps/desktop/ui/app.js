@@ -12,6 +12,11 @@ const unlockPassphrase = document.querySelector("#unlockPassphrase");
 const unlockedPanel = document.querySelector("#unlockedPanel");
 const lockButton = document.querySelector("#lockButton");
 
+const torStateBadge = document.querySelector("#torStateBadge");
+const startTorButton = document.querySelector("#startTorButton");
+const stopTorButton = document.querySelector("#stopTorButton");
+const torMessage = document.querySelector("#torMessage");
+
 function tauriInvoke() {
   const invoke = window.__TAURI__?.core?.invoke;
   if (!invoke) {
@@ -88,7 +93,52 @@ async function lockApplication() {
   }
 }
 
+function renderTorStatus(status) {
+  torStateBadge.textContent = status.state;
+  const busy = status.state === "bootstrapping";
+  startTorButton.disabled = busy || status.state === "ready";
+  stopTorButton.disabled = busy || status.state === "stopped";
+  if (typeof status.bootstrap_fraction === "number") {
+    torMessage.textContent = `Bootstrap progress: ${Math.round(status.bootstrap_fraction * 100)}%`;
+  }
+}
+
+async function refreshTorStatus() {
+  try {
+    const status = await tauriInvoke()("tor_status");
+    renderTorStatus(status);
+  } catch (error) {
+    torMessage.textContent = String(error);
+  }
+}
+
+async function startTor() {
+  torMessage.textContent = "Bootstrapping - this can take a while...";
+  startTorButton.disabled = true;
+  try {
+    const status = await tauriInvoke()("start_tor");
+    renderTorStatus(status);
+    torMessage.textContent = "";
+  } catch (error) {
+    torMessage.textContent = String(error);
+    await refreshTorStatus();
+  }
+}
+
+async function stopTor() {
+  try {
+    const status = await tauriInvoke()("stop_tor");
+    renderTorStatus(status);
+    torMessage.textContent = "";
+  } catch (error) {
+    torMessage.textContent = String(error);
+  }
+}
+
 onboardingForm.addEventListener("submit", completeOnboarding);
 unlockForm.addEventListener("submit", unlockApplication);
 lockButton.addEventListener("click", lockApplication);
+startTorButton.addEventListener("click", startTor);
+stopTorButton.addEventListener("click", stopTor);
 void refreshStatus();
+void refreshTorStatus();

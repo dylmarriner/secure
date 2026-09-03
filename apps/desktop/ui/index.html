@@ -57,13 +57,25 @@
       <section id="unlockedPanel" class="panel" hidden>
         <h2>Vault unlocked</h2>
         <p>
-          This build exposes only lifecycle status and lock through the Tauri IPC boundary.
-          Messaging, Tor transport and attachments are deliberately absent until their audited
-          implementations land.
+          This build exposes lifecycle status, lock and a managed Tor transport through the
+          Tauri IPC boundary. Messaging and attachments are deliberately absent until their
+          audited implementations land - there is nothing to send over Tor yet.
         </p>
         <div class="actions">
           <button id="lockButton" type="button" class="danger-secondary">Lock</button>
         </div>
+
+        <h3>Tor transport</h3>
+        <p>
+          Tor is never started automatically. Bootstrapping can take anywhere from a few
+          seconds to over a minute depending on your network.
+        </p>
+        <div class="actions">
+          <span id="torStateBadge" class="badge">not_started</span>
+          <button id="startTorButton" type="button">Start Tor</button>
+          <button id="stopTorButton" type="button" class="danger-secondary">Stop Tor</button>
+        </div>
+        <p id="torMessage" class="message" aria-live="polite"></p>
       </section>
 
       <p id="message" class="message" aria-live="polite"></p>
