@@ -50,6 +50,8 @@ pub enum LifecycleError {
     InvalidTransition { state: AppState, event: AppEvent },
     #[error("destruction event {event:?} received while application is not destroying")]
     DestructionNotActive { event: DestructionEvent },
+    #[error("destroying application state is missing its destruction stage")]
+    MissingDestructionStage,
     #[error("invalid destruction transition from {stage:?} using {event:?}")]
     InvalidDestructionTransition {
         stage: DestructionStage,
@@ -66,9 +68,15 @@ pub struct AppLifecycle {
 impl AppLifecycle {
     #[must_use]
     pub const fn new(state: AppState) -> Self {
+        let destruction_stage = if matches!(state, AppState::Destroying) {
+            Some(DestructionStage::Armed)
+        } else {
+            None
+        };
+
         Self {
             state,
-            destruction_stage: None,
+            destruction_stage,
         }
     }
 
@@ -112,7 +120,7 @@ impl AppLifecycle {
 
         let stage = self
             .destruction_stage
-            .expect("Destroying state always has a destruction stage");
+            .ok_or(LifecycleError::MissingDestructionStage)?;
 
         let next = match (stage, event) {
             (DestructionStage::Armed, DestructionEvent::UiSealed) => DestructionStage::UiSealed,
