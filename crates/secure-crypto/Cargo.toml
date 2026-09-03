@@ -1,0 +1,15 @@
+[package]
+name = "secure-crypto"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+argon2.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+rand_core.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
