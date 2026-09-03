@@ -17,21 +17,56 @@
         <span id="stateBadge" class="badge">checking</span>
       </header>
 
-      <section class="panel">
-        <h2>Desktop boundary online</h2>
+      <section id="onboardingPanel" class="panel" hidden>
+        <h2>Create your local vault</h2>
+        <p>
+          Choose a passphrase. It never leaves this device and is never sent anywhere. It wraps
+          a randomly generated vault key that actually protects your data - losing this
+          passphrase means losing access to this vault, by design.
+        </p>
+        <form id="onboardingForm" class="vault-form">
+          <label for="onboardingPassphrase">Passphrase</label>
+          <input
+            id="onboardingPassphrase"
+            name="passphrase"
+            type="password"
+            autocomplete="new-password"
+            minlength="12"
+            required
+          />
+          <button type="submit">Create vault</button>
+        </form>
+      </section>
+
+      <section id="lockedPanel" class="panel" hidden>
+        <h2>Vault locked</h2>
+        <p>Enter your passphrase to unlock this device's encrypted vault.</p>
+        <form id="unlockForm" class="vault-form">
+          <label for="unlockPassphrase">Passphrase</label>
+          <input
+            id="unlockPassphrase"
+            name="passphrase"
+            type="password"
+            autocomplete="current-password"
+            required
+          />
+          <button type="submit">Unlock</button>
+        </form>
+      </section>
+
+      <section id="unlockedPanel" class="panel" hidden>
+        <h2>Vault unlocked</h2>
         <p>
           This build exposes only lifecycle status and lock through the Tauri IPC boundary.
-          Messaging, storage and network transport are deliberately absent until their audited
+          Messaging, Tor transport and attachments are deliberately absent until their audited
           implementations land.
         </p>
-
         <div class="actions">
-          <button id="refreshButton" type="button">Refresh status</button>
           <button id="lockButton" type="button" class="danger-secondary">Lock</button>
         </div>
-
-        <p id="message" class="message" aria-live="polite"></p>
       </section>
+
+      <p id="message" class="message" aria-live="polite"></p>
 
       <footer>
         No analytics. No remote assets. No direct frontend networking.

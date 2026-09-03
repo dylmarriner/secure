@@ -179,11 +179,45 @@ Store encrypted records for:
   is one SQL transaction) rather than something proven by a fault-injection test; add one;
 - investigate memory locking for the derived database key independently on Windows and Linux,
   per the key-handling requirement below, and document the result;
-- wire `secure-storage` into the Tauri host / `secure-core` lifecycle (currently a standalone,
-  tested crate with no application-level caller yet - by design, per the "no decorative
-  implementation" engineering rule, until there is a real onboarding/unlock flow to drive it);
 - typed read/write record APIs beyond the test-only insert helpers in `schema.rs` belong to
   whichever later-phase crate (messaging, attachments) actually needs to persist that data.
+
+## Wired into the Tauri host (`apps/desktop/src-tauri`)
+
+`secure-storage` and `secure-crypto` are now driven by real onboarding/unlock/lock commands,
+not left as an unwired library:
+
+- `complete_onboarding(passphrase)`: only valid from `AppState::Onboarding`; generates a vault
+  master key, seals it under the passphrase (`Argon2Profile::RECOMMENDED_V1`), writes the
+  envelope atomically (temp file + rename), then calls `Vault::create_new`. If database
+  creation fails, the just-written envelope is deleted again so a half-finished attempt is
+  never mistaken for an existing vault on the next launch. Enforces a 12-character passphrase
+  floor (a sanity floor, not a strength meter - Argon2id does the real work);
+- `unlock_application(passphrase)`: only valid from `AppState::Locked`; reads and parses the
+  envelope, unwraps the vault master key, and opens the database with the derived subkey. The
+  vault master key and open `Vault` handle are held in `AppRuntime.unlocked`, a
+  `Mutex<Option<UnlockedVault>>` that the WebView has no path to reach - only `AppStatus`
+  crosses the IPC boundary;
+- `lock_application`: on `Unlocked -> Locked`, sets `unlocked` back to `None`, which drops the
+  SQLCipher connection and zeroes the vault master key (`VaultKey` wraps its bytes in
+  `Zeroizing`);
+- on startup, `AppRuntime::new` checks whether the envelope file exists to decide between the
+  `NeedsOnboarding` and `ExistingVault` lifecycle transitions, so a relaunch after onboarding
+  correctly starts `Locked` instead of offering onboarding again.
+
+All command bodies are plain functions over `&AppRuntime` (`*_impl`), with `#[tauri::command]`
+as a thin IPC adapter, specifically so this logic is unit-testable without a running Tauri
+application - there is no display available in this environment to drive the WebView by hand,
+so this is how the flow was actually verified rather than only compiled. 8 tests in
+`apps/desktop/src-tauri/src/main.rs` cover: fresh install starts in onboarding; a full
+onboard -> lock -> unlock -> lock -> simulated-restart -> unlock cycle; rejecting a short
+passphrase without writing an envelope; onboarding cannot run twice; wrong passphrase is
+rejected and lifecycle stays `Locked`; unlock before onboarding is rejected; locking an
+already-locked app is idempotent; a failed database creation cleans up its orphaned envelope.
+
+The frontend (`apps/desktop/ui`) now has real onboarding and unlock forms wired to these
+commands, replacing the earlier status-only UI, still with no remote resources and the same
+restrictive CSP.
 
 ## Exit criteria
 
