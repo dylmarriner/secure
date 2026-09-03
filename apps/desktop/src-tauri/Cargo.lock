@@ -2757,9 +2757,11 @@ dependencies = [
  "argon2",
  "chacha20poly1305",
  "hkdf",
+ "libc",
  "rand_core",
  "sha2",
  "thiserror 2.0.20",
+ "windows-sys 0.59.0",
  "zeroize",
 ]
 

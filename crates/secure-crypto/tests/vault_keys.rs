@@ -54,3 +54,19 @@ fn database_and_config_subkeys_are_domain_separated() {
 
     assert_ne!(&*database, &*config);
 }
+
+#[test]
+fn repeated_generate_and_drop_does_not_panic() {
+    // VaultKey locks its heap-allocated buffer in physical memory on construction
+    // (best-effort mlock/VirtualLock) and unlocks it on drop. This does not - and cannot,
+    // from safe Rust - prove the buffer's contents are actually zero after drop; that would
+    // require reading freed memory. What it does pin: creating and dropping many keys in a
+    // row must never panic, even if the platform lock call itself fails (missing privilege,
+    // RLIMIT_MEMLOCK exceeded, etc.) - failures there are deliberately best-effort and must
+    // never be treated as fatal.
+    for _ in 0..64 {
+        let key = VaultKey::generate().expect("OS randomness");
+        let _ = key.derive_subkey(SubkeyPurpose::DatabaseV1);
+        drop(key);
+    }
+}

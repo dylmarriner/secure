@@ -152,7 +152,13 @@ Store encrypted records for:
 - initial schema (`migrations/0001_initial_schema.sql`) covering local identity metadata,
   contacts, invitations, protocol adapter state, conversations, messages, drafts, attachment
   metadata/keys, app config and destruction tombstones, exactly as scoped below. All record ids
-  are random 128-bit opaque tokens rather than sequential integers.
+  are random 128-bit opaque tokens rather than sequential integers;
+- a second migration (`migrations/0002_foreign_key_indexes.sql`, schema version 2) adds indexes
+  on `attachments.message_id` and `invitations.resulting_contact_id` - SQLite does not
+  auto-index foreign key columns, and Burn Conversation/Burn Identity cascading deletes need
+  these to not be full table scans. This is real schema work the vault needed regardless of
+  wanting a second migration to test against; it was not invented just to exercise the
+  migration path.
 
 ## Tests (passing)
 
@@ -166,21 +172,59 @@ Store encrypted records for:
 - opening a missing vault fails closed rather than creating one (`open_existing_rejects_missing_path`);
 - correct key round-trips create -> close -> reopen (`round_trips_with_correct_key`);
 - plaintext message content inserted through the schema layer cannot be found anywhere in the
-  raw on-disk file after the vault is closed (`no_application_controlled_plaintext_message_persistence`).
+  raw on-disk file after the vault is closed (`no_application_controlled_plaintext_message_persistence`);
+- a vault rolled back to look exactly like an existing user's on-disk file from before
+  migration 0002 shipped (real inserted conversation/message data, `user_version` reset to 1,
+  0002's indexes dropped) migrates forward to the current schema on `open_existing`, ends up
+  with 0002's indexes present, and keeps every row inserted before the migration ran
+  (`migrating_forward_preserves_existing_encrypted_state`);
+- a migration step whose SQL fails partway through leaves `user_version` untouched and none of
+  its schema changes applied - proving the transaction-per-step design is safe against a crash
+  or forced interruption at any point during a migration, independent of which SQL any future
+  migration happens to contain (`migrations::tests::a_failing_migration_step_leaves_user_version_and_schema_untouched`);
+- calling the migration runner again once a database is already at the latest schema version is
+  a no-op rather than re-running (and failing) already-applied migrations
+  (`migrations::tests::migrate_to_latest_is_a_no_op_once_already_current`).
 
 `wrong passphrase cannot produce a usable vault key` is already covered in
 `crates/secure-crypto` (Phase 0), one layer below this crate.
 
 ## Remaining work
 
-- migrations preserving encrypted state across a real version bump has no test yet, because
-  only one migration (`0001`) exists; add a regression test the day a `0002` migration lands;
-- interrupted-migration crash-consistency is currently a design property (each migration step
-  is one SQL transaction) rather than something proven by a fault-injection test; add one;
-- investigate memory locking for the derived database key independently on Windows and Linux,
-  per the key-handling requirement below, and document the result;
 - typed read/write record APIs beyond the test-only insert helpers in `schema.rs` belong to
   whichever later-phase crate (messaging, attachments) actually needs to persist that data.
+
+## Memory locking (`crates/secure-crypto/src/memlock.rs`)
+
+Implemented for the vault master key specifically, not for every derived buffer:
+
+- `VaultKey` is heap-allocated (`Box<[u8; 32]>`) rather than stack-allocated. This is the part
+  that actually matters: `mlock`/`VirtualLock` pin a page range at a fixed address, and an
+  ordinary Rust value can move (on return, on reassignment) after being locked, leaving the
+  lock on a now-unrelated page while the real data sits unlocked at its new address. A `Box`'s
+  heap allocation does not move when the `Box` handle itself moves, so locking it once, right
+  after allocation, stays valid for the value's whole lifetime;
+- locked via `libc::mlock`/`munlock` on Unix and `VirtualLock`/`VirtualUnlock` (via
+  `windows-sys`) on Windows, both best-effort - failures (missing privilege, `RLIMIT_MEMLOCK`
+  exceeded, locked-pages quota) are ignored rather than fatal, matching the project's stated
+  position that this is used "where practical without pretending this defeats a hostile OS";
+  verified to compile for Windows via `cargo check --target x86_64-pc-windows-gnu` in this
+  environment, since there is no Windows machine available here to actually run it - that
+  remains to be exercised on real Windows;
+- `Drop for VaultKey` unlocks the range and then zeroes it manually (`[u8;32]::zeroize()`) -
+  not via `Zeroizing<Box<...>>`, because `zeroize`'s `Box<T>` impl requires
+  `T: DefaultIsZeroes`, which fixed-size arrays deliberately do not implement (they zero
+  element-by-element instead), so that combination does not compile;
+- deliberately **not** applied to subkeys returned by `VaultKey::derive_subkey` (the database
+  and local-config subkeys): those are short-lived, stack-allocated, single-use buffers (e.g.
+  handed to SQLCipher as a hex string and dropped immediately), and locking them would mean
+  boxing every derived subkey for comparatively little benefit against the swap/hibernation
+  threat this defends against. This is a scoping decision, not an oversight;
+- there is no test that proves the buffer's contents are physically zero after `Drop` - doing
+  that from safe Rust would require reading freed memory, which is undefined behaviour. What
+  *is* tested (`repeated_generate_and_drop_does_not_panic` in
+  `crates/secure-crypto/tests/vault_keys.rs`) is that repeated lock/unlock/drop cycles never
+  panic, including when the underlying platform call itself fails.
 
 ## Wired into the Tauri host (`apps/desktop/src-tauri`)
 

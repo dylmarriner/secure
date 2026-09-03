@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 ///
 /// Persistent formats are versioned per the project engineering rules: bumping this value
 /// must be paired with a new entry in [`migrations::MIGRATIONS`].
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -112,6 +112,11 @@ impl Vault {
     }
 
     /// Direct access to the underlying connection for record-level test helpers.
+    #[cfg(test)]
+    pub(crate) fn connection(&self) -> &Connection {
+        &self.conn
+    }
+
     #[cfg(test)]
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
@@ -319,6 +324,87 @@ mod tests {
             !contains_subslice(&raw, secret_marker.as_bytes()),
             "plaintext message content must not appear in the on-disk vault file"
         );
+    }
+
+    #[test]
+    fn migrating_forward_preserves_existing_encrypted_state() {
+        use schema::{ConversationRecord, MessageRecord};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.db");
+        let vault_key = key();
+
+        // Build a vault the way an already-deployed build that only shipped migration 0001
+        // would have: create it, insert real data, then roll it back to schema version 1 by
+        // dropping the objects migration 0002 adds. This is what an existing user's vault on
+        // disk actually looks like right before they upgrade to a build carrying 0002.
+        let mut vault = Vault::create_new(&path, &vault_key).expect("create");
+        let conversation_id = schema::insert_conversation(
+            &mut vault,
+            &ConversationRecord {
+                local_alias: "pre-migration-contact".into(),
+            },
+        )
+        .expect("insert conversation");
+        schema::insert_message(
+            &mut vault,
+            &MessageRecord {
+                conversation_id: conversation_id.clone(),
+                ciphertext: b"pre-migration ciphertext".to_vec(),
+            },
+        )
+        .expect("insert message");
+        vault
+            .connection_mut()
+            .execute_batch(
+                "DROP INDEX attachments_message_id_idx; \
+                 DROP INDEX invitations_resulting_contact_id_idx;",
+            )
+            .expect("drop 0002 objects");
+        vault
+            .connection_mut()
+            .pragma_update(None, "user_version", 1)
+            .expect("roll back to schema version 1");
+        drop(vault);
+
+        // Reopening must run migration 0002 forward and must not touch the data already
+        // inserted at version 1.
+        let vault = Vault::open_existing(&path, &vault_key).expect("reopen and migrate forward");
+        assert_eq!(vault.schema_version().expect("version"), SCHEMA_VERSION);
+
+        let index_count: i64 = vault
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name IN \
+                 ('attachments_message_id_idx', 'invitations_resulting_contact_id_idx');",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query sqlite_master");
+        assert_eq!(
+            index_count, 2,
+            "migration 0002's indexes must have been (re)created"
+        );
+
+        let preserved_alias: String = vault
+            .connection()
+            .query_row(
+                "SELECT local_alias FROM conversations WHERE id = ?1;",
+                rusqlite::params![conversation_id],
+                |row| row.get(0),
+            )
+            .expect("conversation inserted before migration must survive it");
+        assert_eq!(preserved_alias, "pre-migration-contact");
+
+        let preserved_message_count: i64 = vault
+            .connection()
+            .query_row(
+                "SELECT count(*) FROM messages WHERE conversation_id = ?1;",
+                rusqlite::params![conversation_id],
+                |row| row.get(0),
+            )
+            .expect("message inserted before migration must survive it");
+        assert_eq!(preserved_message_count, 1);
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

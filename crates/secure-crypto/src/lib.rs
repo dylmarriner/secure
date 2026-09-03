@@ -3,6 +3,8 @@
 //! This crate intentionally covers only local key hierarchy and envelope handling. Messaging
 //! cryptography belongs to the reviewed messaging protocol implementation, not here.
 
+mod memlock;
+
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -12,7 +14,7 @@ use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"SVK1";
 const FORMAT_VERSION: u8 = 1;
@@ -77,15 +79,35 @@ impl Argon2Profile {
     }
 }
 
-pub struct VaultKey(Zeroizing<[u8; VAULT_KEY_LEN]>);
+/// The vault master key.
+///
+/// Backed by a heap allocation (`Box`) rather than an inline array so its address is stable
+/// for the value's whole lifetime: [`Self::from_boxed`] locks that address in physical memory
+/// once, right after allocation, and the lock stays valid because the buffer never moves
+/// again (only the `Box` handle itself may move; the heap allocation it points to does not).
+/// See `memlock` module docs for why this matters and why derived subkeys are not locked.
+///
+/// The buffer is zeroed manually in [`Drop`] rather than via [`Zeroizing`] - `zeroize`'s
+/// `Box<T>` impl is only available for `T: DefaultIsZeroes`, which fixed-size byte arrays
+/// deliberately do not implement (they zero element-by-element instead), so `Zeroizing<Box<[u8;
+/// N]>>` does not compile. `[u8; VAULT_KEY_LEN]` itself does implement `Zeroize` directly, so
+/// `Drop` calls that.
+pub struct VaultKey(Box<[u8; VAULT_KEY_LEN]>);
 
 impl VaultKey {
     pub fn generate() -> Result<Self, CryptoError> {
-        let mut bytes = [0_u8; VAULT_KEY_LEN];
+        let mut bytes = Box::new([0_u8; VAULT_KEY_LEN]);
         let mut rng = OsRng;
-        rng.try_fill_bytes(&mut bytes)
+        rng.try_fill_bytes(&mut *bytes)
             .map_err(|_| CryptoError::RandomnessUnavailable)?;
-        Ok(Self(Zeroizing::new(bytes)))
+        Ok(Self::from_boxed(bytes))
+    }
+
+    /// Take ownership of an already-populated, heap-allocated key buffer, locking it in
+    /// physical memory (best-effort) before wrapping it so `Drop` zeroes it.
+    fn from_boxed(bytes: Box<[u8; VAULT_KEY_LEN]>) -> Self {
+        memlock::lock(bytes.as_ptr(), VAULT_KEY_LEN);
+        Self(bytes)
     }
 
     #[must_use]
@@ -102,6 +124,15 @@ impl VaultKey {
         hkdf.expand(purpose.label(), &mut *output)
             .map_err(|_| CryptoError::SubkeyDerivationFailed)?;
         Ok(output)
+    }
+}
+
+impl Drop for VaultKey {
+    fn drop(&mut self) {
+        // Unlock while the buffer is still valid memory (munlock/VirtualUnlock only need the
+        // address and length, not the contents), then zero it before the allocation is freed.
+        memlock::unlock(self.0.as_ptr(), VAULT_KEY_LEN);
+        self.0.zeroize();
     }
 }
 
@@ -190,9 +221,9 @@ impl VaultKeyEnvelope {
             return Err(CryptoError::InvalidEnvelope);
         }
 
-        let mut key = [0_u8; VAULT_KEY_LEN];
+        let mut key = Box::new([0_u8; VAULT_KEY_LEN]);
         key.copy_from_slice(&plaintext);
-        Ok(VaultKey(Zeroizing::new(key)))
+        Ok(VaultKey::from_boxed(key))
     }
 
     #[must_use]
