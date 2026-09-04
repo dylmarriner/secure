@@ -106,6 +106,26 @@ struct UnlockedVault {
     vault: Vault,
 }
 
+/// Ghost Session's runtime-only identity material (Phase 7). Deliberately reuses
+/// `secure_crypto::VaultKey` rather than a bespoke type: the security properties Ghost needs -
+/// a random 256-bit key, memory-locked best-effort, zeroed on drop - are exactly what
+/// `VaultKey` already provides, and it was never actually specific to wrapping a persistent
+/// vault; it is just "a locked, zeroizing 256-bit key" that happens to be named for its first
+/// use. Forking a near-identical type here to get a different name would be exactly the
+/// decorative duplication the project's engineering rules rule out.
+///
+/// There is nothing else in this struct, and that absence is the point: Ghost has no envelope
+/// file, no database file, no on-disk state of any kind. This key exists only in this `Mutex`,
+/// for as long as `end_ghost`/identity burn has not yet cleared it.
+///
+/// `key` is held only for its `Drop` behaviour and is never read directly - the same pattern as
+/// `UnlockedVault` above, for the same reason: nothing in this binary reaches into Ghost's key
+/// material except through that `Drop` implementation.
+#[allow(dead_code)]
+struct GhostSession {
+    key: VaultKey,
+}
+
 struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     paths: VaultPaths,
@@ -116,6 +136,11 @@ struct AppRuntime {
     /// messaging layer yet to decide *when* Tor should be required, so this deliberately does
     /// not interlock with vault lock/unlock - see `docs/implementation-plan.md` Phase 2.
     transport: TorTransport,
+    /// The active Ghost session's ephemeral identity, if any - see [`GhostSession`]. Never
+    /// read or written by any code path that also touches `paths`/`unlocked`; that separation
+    /// is what makes "normal database remains unchanged by Ghost conversations" true by
+    /// construction rather than by a runtime check that could be forgotten somewhere.
+    ghost: Mutex<Option<GhostSession>>,
 }
 
 impl AppRuntime {
@@ -140,6 +165,7 @@ impl AppRuntime {
                 paths,
                 unlocked: Mutex::new(None),
                 transport,
+                ghost: Mutex::new(None),
             };
             runtime.resume_interrupted_identity_burn();
             return Ok(runtime);
@@ -173,6 +199,7 @@ impl AppRuntime {
             paths,
             unlocked: Mutex::new(None),
             transport,
+            ghost: Mutex::new(None),
         })
     }
 
@@ -376,13 +403,18 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
             }
         }
 
-        // RuntimeSecretsRevoked: drop any open vault handle. `UnlockedVault`'s own `Drop`
-        // implementation closes the SQLCipher connection and zeroes the vault master key
-        // (`VaultKey` wraps its bytes in `Zeroizing`) - there is no separate "zero the key" step
-        // to write here.
+        // RuntimeSecretsRevoked: drop any open vault handle, and any active Ghost session key.
+        // `UnlockedVault`/`GhostSession`'s own `Drop` implementations close the SQLCipher
+        // connection and zero their keys respectively - there is no separate "zero the key"
+        // step to write here. A burn reached from `AppState::Ghost` is exactly the case that
+        // needs the second of these; burning from `Locked`/`Unlocked` finds `ghost` already
+        // `None` and this is a no-op.
         DestructionEvent::RuntimeSecretsRevoked => {
             if let Ok(mut unlocked) = runtime.unlocked.lock() {
                 *unlocked = None;
+            }
+            if let Ok(mut ghost) = runtime.ghost.lock() {
+                *ghost = None;
             }
         }
 
@@ -625,6 +657,78 @@ fn lock_application_impl(runtime: &AppRuntime) -> Result<AppStatus, String> {
     Ok(status_for(lifecycle.state()))
 }
 
+/// Enter Ghost Session (Phase 7): a deliberately ephemeral mode with no intentional persistent
+/// state. Only valid from `Locked` - not `Unlocked`, so a Ghost session never begins alongside
+/// an already-open normal vault handle, and not `Ghost` itself, since a session is either
+/// active or it is not.
+///
+/// The generated [`GhostSession`] key is never written anywhere. There is no envelope file, no
+/// database file, no journal - the only place this key exists is `runtime.ghost`, for as long
+/// as `end_ghost` or an identity burn has not yet cleared it. A process restart while a Ghost
+/// session is active constructs a fresh `AppRuntime` with `ghost: None`, from
+/// [`AppRuntime::new`]'s normal startup path (there is no ghost-specific file for it to find) -
+/// so "Ghost session restart does not recover previous session state" holds by construction,
+/// not by an explicit check.
+fn start_ghost_impl(runtime: &AppRuntime) -> Result<AppStatus, String> {
+    let mut lifecycle = runtime
+        .lifecycle
+        .lock()
+        .map_err(|_| "application lifecycle lock poisoned".to_owned())?;
+
+    if lifecycle.state() != AppState::Locked {
+        return Err(format!(
+            "cannot start a Ghost session from {:?}",
+            lifecycle.state()
+        ));
+    }
+
+    let key =
+        VaultKey::generate().map_err(|_| "failed to generate Ghost session key".to_owned())?;
+
+    lifecycle
+        .apply(AppEvent::StartGhost)
+        .map_err(|error| error.to_string())?;
+
+    let mut ghost = runtime
+        .ghost
+        .lock()
+        .map_err(|_| "ghost session lock poisoned".to_owned())?;
+    *ghost = Some(GhostSession { key });
+
+    Ok(status_for(lifecycle.state()))
+}
+
+/// Exit Ghost Session, destroying its ephemeral key. Only valid from `Ghost`. Ends up `Locked`,
+/// the same place [`lock_application_impl`] returns to from `Unlocked` - Ghost and normal
+/// unlocked access both collapse back to the same "nothing sensitive is open" resting state.
+fn end_ghost_impl(runtime: &AppRuntime) -> Result<AppStatus, String> {
+    let mut lifecycle = runtime
+        .lifecycle
+        .lock()
+        .map_err(|_| "application lifecycle lock poisoned".to_owned())?;
+
+    if lifecycle.state() != AppState::Ghost {
+        return Err(format!(
+            "cannot end a Ghost session from {:?}",
+            lifecycle.state()
+        ));
+    }
+
+    lifecycle
+        .apply(AppEvent::EndGhost)
+        .map_err(|error| error.to_string())?;
+
+    let mut ghost = runtime
+        .ghost
+        .lock()
+        .map_err(|_| "ghost session lock poisoned".to_owned())?;
+    // Dropping the previous value here zeroes the Ghost session key (`VaultKey` wraps its
+    // bytes in `Zeroizing`), matching `lock_application_impl`'s handling of `unlocked`.
+    *ghost = None;
+
+    Ok(status_for(lifecycle.state()))
+}
+
 /// Deliberately destroy this installation's identity and all local vault data, on request.
 ///
 /// Until now the *only* path into Burn Identity was the wipe-on-three-wrong-passphrases failsafe
@@ -817,6 +921,16 @@ fn burn_identity(
     burn_identity_impl(replacement_passphrase, &runtime)
 }
 
+#[tauri::command]
+fn start_ghost(runtime: State<'_, AppRuntime>) -> Result<AppStatus, String> {
+    start_ghost_impl(&runtime)
+}
+
+#[tauri::command]
+fn end_ghost(runtime: State<'_, AppRuntime>) -> Result<AppStatus, String> {
+    end_ghost_impl(&runtime)
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -844,6 +958,8 @@ fn main() {
             unlock_application,
             lock_application,
             burn_identity,
+            start_ghost,
+            end_ghost,
             tor_status,
             start_tor,
             stop_tor
@@ -1516,5 +1632,106 @@ mod tests {
             .await
             .expect_err("cannot restart a stopped transport");
         assert!(error.contains("Stopped"));
+    }
+
+    #[test]
+    fn ghost_session_starts_from_locked_and_ends_back_to_locked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+
+        let status = start_ghost_impl(&runtime).expect("start ghost");
+        assert_eq!(status.state, "ghost");
+        assert!(
+            runtime.ghost.lock().unwrap().is_some(),
+            "an active ghost session must be tracked in memory"
+        );
+
+        let status = end_ghost_impl(&runtime).expect("end ghost");
+        assert_eq!(status.state, "locked");
+        assert!(
+            runtime.ghost.lock().unwrap().is_none(),
+            "ending the session must clear its key"
+        );
+    }
+
+    #[test]
+    fn ghost_session_is_refused_before_onboarding_completes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+
+        let error = start_ghost_impl(&runtime).expect_err("no vault exists yet");
+        assert!(error.contains("cannot start a Ghost session from"));
+    }
+
+    #[test]
+    fn ghost_session_is_refused_while_the_normal_vault_is_unlocked() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime).expect("unlock");
+
+        let error = start_ghost_impl(&runtime)
+            .expect_err("must not start a ghost session over an open normal vault");
+        assert!(error.contains("cannot start a Ghost session from"));
+    }
+
+    #[test]
+    fn ending_a_ghost_session_that_was_never_started_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+
+        let error = end_ghost_impl(&runtime).expect_err("no ghost session is active");
+        assert!(error.contains("cannot end a Ghost session from"));
+    }
+
+    #[test]
+    fn normal_unlock_and_onboarding_are_refused_while_in_a_ghost_session() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        start_ghost_impl(&runtime).expect("start ghost");
+
+        let error = unlock_application_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect_err("must not unlock the normal vault from inside a ghost session");
+        assert!(error.contains("cannot unlock from"));
+        assert!(
+            runtime.unlocked.lock().unwrap().is_none(),
+            "the normal vault must remain untouched while in a ghost session"
+        );
+    }
+
+    #[test]
+    fn a_restart_during_a_ghost_session_does_not_recover_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        start_ghost_impl(&runtime).expect("start ghost");
+
+        // A "restart" is a brand-new AppRuntime over the same on-disk directory. Ghost has no
+        // file of its own for the new process to find, so it must come back Locked, never
+        // Ghost, regardless of what the crashed process's in-memory state was.
+        let restarted = runtime_in(dir.path());
+        let status = app_status_impl(&restarted).expect("status");
+        assert_eq!(status.state, "locked");
+        assert!(restarted.ghost.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn burning_identity_from_a_ghost_session_destroys_the_ghost_key_too() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        start_ghost_impl(&runtime).expect("start ghost");
+        assert!(runtime.ghost.lock().unwrap().is_some());
+
+        let status = burn_identity_impl(None, &runtime).expect("burn from ghost");
+        assert_eq!(status.state, "destroyed");
+        assert!(
+            runtime.ghost.lock().unwrap().is_none(),
+            "burning identity must also clear an active ghost session's key"
+        );
+        assert!(!runtime.paths.envelope.exists());
     }
 }

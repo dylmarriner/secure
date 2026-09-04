@@ -52,6 +52,34 @@
           />
           <button type="submit">Unlock</button>
         </form>
+
+        <h3>Ghost Session</h3>
+        <p>
+          A disposable session with no connection to your vault. Nothing it does is written to
+          this device's normal storage - no history, no contacts, no drafts - and it leaves
+          nothing behind for a restart to recover.
+        </p>
+        <p class="fineprint">
+          What this cannot promise: swap, hibernation, a crash dump, EDR, or screenshots remain
+          outside this application's control while the session is running.
+        </p>
+        <div class="actions">
+          <button id="startGhostButton" type="button">Start Ghost Session</button>
+        </div>
+      </section>
+
+      <section id="ghostPanel" class="panel" hidden>
+        <h2>Ghost Session active</h2>
+        <p>
+          You are in a disposable session. Your normal vault stays locked and untouched -
+          nothing here can read or write it. Ending this session destroys its key immediately;
+          there is nothing to recover afterwards, by design.
+        </p>
+        <div class="actions">
+          <button id="endGhostButton" type="button" class="danger-secondary">
+            End Ghost Session
+          </button>
+        </div>
       </section>
 
       <section id="unlockedPanel" class="panel" hidden>

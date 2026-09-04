@@ -8,6 +8,10 @@ const onboardingPassphrase = document.querySelector("#onboardingPassphrase");
 const lockedPanel = document.querySelector("#lockedPanel");
 const unlockForm = document.querySelector("#unlockForm");
 const unlockPassphrase = document.querySelector("#unlockPassphrase");
+const startGhostButton = document.querySelector("#startGhostButton");
+
+const ghostPanel = document.querySelector("#ghostPanel");
+const endGhostButton = document.querySelector("#endGhostButton");
 
 const unlockedPanel = document.querySelector("#unlockedPanel");
 const lockButton = document.querySelector("#lockButton");
@@ -43,12 +47,13 @@ const PANELS_BY_STATE = {
   onboarding: onboardingPanel,
   locked: lockedPanel,
   unlocked: unlockedPanel,
+  ghost: ghostPanel,
   destroyed: destroyedPanel,
 };
 
 // States in which an identity exists to be destroyed. Mirrors the backend's own accepted
 // states for `burn_identity`; the backend refuses anything else regardless of what is shown.
-const BURNABLE_STATES = new Set(["locked", "unlocked"]);
+const BURNABLE_STATES = new Set(["locked", "unlocked", "ghost"]);
 
 function resetBurnConfirmation() {
   burnForm.hidden = true;
@@ -60,7 +65,7 @@ function resetBurnConfirmation() {
 function renderStatus(status) {
   stateBadge.textContent = status.state;
 
-  for (const panel of [onboardingPanel, lockedPanel, unlockedPanel, destroyedPanel]) {
+  for (const panel of [onboardingPanel, lockedPanel, unlockedPanel, ghostPanel, destroyedPanel]) {
     panel.hidden = true;
   }
 
@@ -119,6 +124,26 @@ async function lockApplication() {
     const status = await tauriInvoke()("lock_application");
     renderStatus(status);
     message.textContent = "Application locked.";
+  } catch (error) {
+    message.textContent = String(error);
+  }
+}
+
+async function startGhost() {
+  try {
+    const status = await tauriInvoke()("start_ghost");
+    renderStatus(status);
+    message.textContent = "";
+  } catch (error) {
+    message.textContent = String(error);
+  }
+}
+
+async function endGhost() {
+  try {
+    const status = await tauriInvoke()("end_ghost");
+    renderStatus(status);
+    message.textContent = "Ghost session ended. Its key no longer exists.";
   } catch (error) {
     message.textContent = String(error);
   }
@@ -201,6 +226,8 @@ async function stopTor() {
 onboardingForm.addEventListener("submit", completeOnboarding);
 unlockForm.addEventListener("submit", unlockApplication);
 lockButton.addEventListener("click", lockApplication);
+startGhostButton.addEventListener("click", startGhost);
+endGhostButton.addEventListener("click", endGhost);
 burnRevealButton.addEventListener("click", revealBurnConfirmation);
 burnCancelButton.addEventListener("click", () => {
   resetBurnConfirmation();

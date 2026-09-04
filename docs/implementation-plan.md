@@ -997,28 +997,69 @@ Destruction has a tested monotonic crash-consistent implementation on Windows an
 
 # Phase 7 - Ghost Session
 
+**Status:** In progress
+
 ## Objective
 
 Provide a deliberately ephemeral session mode that does not intentionally persist identity, contact or conversation state.
 
 ## Work
 
-- generate session-only identity and keys;
-- use memory-backed protocol/session storage where possible;
-- if disk-backed protocol state is unavoidable, encrypt it under a random ephemeral key that is never persisted;
-- prohibit normal vault writes from Ghost mode;
-- disable durable drafts/history/contact aliases;
-- destroy session material on exit;
-- expose clear UI distinction between normal and Ghost modes;
-- document that swap, hibernation, crash dumps, EDR, screenshots and hostile endpoint acquisition remain outside guaranteed control.
+- [x] generate session-only identity and keys - `start_ghost` generates a fresh
+      `secure_crypto::VaultKey` (deliberately reused rather than forked into a same-shaped
+      `GhostKey` type - see `GhostSession`'s doc comment in `apps/desktop/src-tauri/src/main.rs`
+      for why that would be decorative duplication) and holds it only in
+      `AppRuntime.ghost: Mutex<Option<GhostSession>>`;
+- [ ] use memory-backed protocol/session storage where possible - not yet applicable: there is
+      no messaging layer wired into the host yet (`secure-messaging` is a standalone, tested
+      crate - see Phase 3) for a Ghost session to hold protocol state for in the first place;
+- [ ] if disk-backed protocol state is unavoidable, encrypt it under a random ephemeral key -
+      same reason, not yet applicable;
+- [x] prohibit normal vault writes from Ghost mode - structural, not a runtime check bolted on
+      top: `complete_onboarding`/`unlock_application` each only accept their own single source
+      state (`Onboarding`/`Locked` respectively), so both already refuse from `Ghost` without
+      Ghost-specific code, and `AppRuntime.ghost` is never read or written by any code path that
+      also touches `paths`/`unlocked`;
+- [ ] disable durable drafts/history/contact aliases - not yet applicable, same reason as the
+      memory-backed-storage item: there is no messaging/contacts layer in the host yet whose
+      durable state Ghost would need to disable;
+- [x] destroy session material on exit - `end_ghost` clears `AppRuntime.ghost`, which drops the
+      `VaultKey` and zeroes it (same `Zeroizing`-on-drop mechanism `UnlockedVault` already
+      relies on for the normal vault key); burning identity from *inside* a Ghost session also
+      clears it, via the same `RuntimeSecretsRevoked` destruction stage that already drops
+      `unlocked`;
+- [x] expose clear UI distinction between normal and Ghost modes - a dedicated `ghostPanel`
+      distinct from the normal locked/unlocked panels, entered only via an explicit "Start Ghost
+      Session" button on the locked screen, with its own "End Ghost Session" exit;
+- [x] document that swap, hibernation, crash dumps, EDR, screenshots and hostile endpoint
+      acquisition remain outside guaranteed control - stated directly in the Ghost panel's own
+      fine print in the UI, not just in this document.
 
-## Tests
+## Tests (passing, 7 new tests in `apps/desktop/src-tauri/src/main.rs`)
 
-- Ghost mode cannot access normal persistent identity state without an explicit permitted bridge;
-- Ghost session restart does not recover previous identity/session state;
-- normal database remains unchanged by Ghost conversations;
-- exit destroys runtime key access;
-- crash recovery does not accidentally promote ephemeral state to persistent state.
+- Ghost mode cannot access normal persistent identity state without an explicit permitted
+  bridge - `ghost_session_is_refused_while_the_normal_vault_is_unlocked` (cannot start Ghost
+  over an open normal vault) and `normal_unlock_and_onboarding_are_refused_while_in_a_ghost_session`
+  (cannot unlock the normal vault from inside a Ghost session, and the normal vault's `unlocked`
+  field is confirmed to stay `None` throughout);
+- Ghost session restart does not recover previous identity/session state -
+  `a_restart_during_a_ghost_session_does_not_recover_it`: a fresh `AppRuntime` constructed over
+  the same on-disk directory while a Ghost session is (in-memory) active comes back `Locked`,
+  never `Ghost`, because there is no ghost-specific file for it to find;
+- normal database remains unchanged by Ghost conversations - true by construction (see "Work"
+  above), reinforced by the assertion in the cross-contamination test above that `unlocked`
+  never becomes populated;
+- exit destroys runtime key access - `ghost_session_starts_from_locked_and_ends_back_to_locked`
+  asserts `runtime.ghost` is `Some` while active and `None` immediately after `end_ghost`;
+- crash recovery does not accidentally promote ephemeral state to persistent state - there is no
+  crash-recovery code path for Ghost at all (unlike Burn Identity's journal), which is itself
+  the property: nothing reads or writes a Ghost-specific file on startup, so there is nothing
+  for a crash to leave behind to promote;
+- additionally: `ghost_session_is_refused_before_onboarding_completes`,
+  `ending_a_ghost_session_that_was_never_started_is_refused`, and
+  `burning_identity_from_a_ghost_session_destroys_the_ghost_key_too` (burn's
+  `RuntimeSecretsRevoked` stage clears an active Ghost session's key, not just the normal
+  vault's).
 
 ## Exit criteria
 
