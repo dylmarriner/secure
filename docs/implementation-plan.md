@@ -695,27 +695,257 @@ Provide application-wide cryptographic destruction with crash consistency.
 
 ## Required sequence
 
-1. enter `Destroying` state;
-2. stop messaging and Tor activity;
-3. revoke normal runtime vault access;
-4. atomically invalidate/delete the persistent wrapped vault-master-key envelope;
-5. persist sufficient destruction/tombstone state without recreating the destroyed envelope;
-6. zero in-memory vault/subkeys where feasible;
-7. close database handles;
-8. best-effort delete encrypted database, sidecars, attachment ciphertext and sensitive configuration;
-9. reach terminal `Destroyed` state.
+1. [x] enter `Destroying` state;
+2. [x] stop messaging and Tor activity - Tor only; there is no messaging activity to stop yet
+       (`secure-messaging` is not wired into the desktop host). Once it is, its shutdown belongs
+       in `perform_destruction_step`'s `NetworkStopped` arm, alongside the transport stop;
+3. [x] revoke normal runtime vault access;
+4. [x] atomically invalidate/delete the persistent wrapped vault-master-key envelope;
+5. [x] persist sufficient destruction/tombstone state without recreating the destroyed envelope -
+       a durable destruction journal (`vault.burn`), see "Crash-consistent destruction journal"
+       below. Deliberately *not* a permanent tombstone: it is deleted once the burn completes,
+       because a lasting "an identity was destroyed here" marker is exactly the retained metadata
+       engineering rule 8 forbids, and there is nothing left to protect by that point;
+6. [x] zero in-memory vault/subkeys where feasible - via `UnlockedVault`'s own `Drop`;
+7. [x] close database handles - same `Drop`;
+8. [x] best-effort delete encrypted database and sensitive configuration (the attempts counter);
+       sidecars and attachment ciphertext are not yet applicable (no WAL sidecars by design, no
+       attachment pipeline yet - Phase 4);
+9. [x] reach terminal `Destroyed` state - and, once reached, the journal is cleared so the data
+       directory is indistinguishable from a fresh install.
 
-The critical security boundary is step 4. Files left behind after that point should be cryptographically useless to the application if the design is functioning correctly.
+The critical security boundary is step 4. Files left behind after that point should be
+cryptographically useless to the application if the design is functioning correctly.
+
+**Status:** the sequence is now crash-consistent and resumable across a restart from any stage,
+and reachable deliberately rather than only via the wrong-passphrase failsafe. See the three
+"Implemented" sections below.
+
+## Implemented: deliberate burn trigger (`burn_identity`)
+
+Until this landed, the *only* way to reach Burn Identity was the wipe-on-three-wrong-passphrases
+failsafe below - meaning a user who wanted to destroy their data on purpose had to either
+deliberately fail their own passphrase three times or delete files by hand, neither of which runs
+the ordered destruction sequence. `burn_identity` is that same sequence, invoked on purpose.
+
+- accepted from `Locked`, `Unlocked` and `Ghost`, matching `AppEvent::BeginIdentityBurn`'s own
+  accepted states; idempotent from `Destroyed` (reports success rather than an error, matching
+  `lock_application`/`stop_tor`'s existing idempotency); refused from `Onboarding` with an error
+  rather than pretending to have destroyed something that never existed;
+- **deliberately does not require the passphrase.** Someone who can already operate the running
+  application can destroy its data. Demanding the passphrase first would make destruction
+  unavailable in precisely the situations a burn feature exists for - including the case where
+  the user genuinely no longer knows it;
+- optionally takes a replacement passphrase - see "Implemented: replacement identity" below;
+- confirmation is the UI's responsibility, not the command's: `apps/desktop/ui` requires typing
+  `DESTROY` into a form that is collapsed by default and re-collapsed on every state change, so a
+  second stray click cannot trigger an action with no undo. The panel states plainly what the
+  burn cannot reach - copies already delivered to contacts, OS swap/hibernation/crash dumps,
+  backups and filesystem snapshots, drive firmware - rather than implying the data is gone
+  everywhere.
+
+## Implemented: crash-consistent destruction journal (`src/destruction_journal.rs`)
+
+This closes the "Known gap" previously recorded here: identity burn now has the same on-disk,
+resumable stage tracking `secure-storage::burn` has for conversations.
+
+- `vault.burn` next to the envelope records the destruction stage. Its **existence** is the
+  signal that a burn is pending and must be finished; its contents only refine where to resume.
+  Versioned (`SDJ1` magic) per engineering rule 6;
+- `AppRuntime::new` checks the journal **before** the vault-exists branch, because the dangerous
+  case is the one where both are true: a burn that crashed before deleting the envelope leaves a
+  perfectly openable vault on disk, and the application would otherwise come back offering the
+  normal unlock prompt for an identity the user had already ordered destroyed. A recovered
+  journal instead reconstructs the lifecycle via the new `AppLifecycle::resuming_destruction`
+  and drives the remaining stages to `Destroyed`;
+- **ordering rule, and why only one direction is safe.** The journal is *armed* (`Armed` written)
+  before any work begins - that write is what commits the application to finishing. Each
+  individual stage is then recorded only *after* its work has run. A crash in that gap leaves the
+  journal understating progress, so recovery re-runs one step; every step is idempotent (stopping
+  an already-stopped transport, dropping an already-dropped handle, deleting an already-deleted
+  file), so that costs a no-op. Recording a stage *before* its work would produce the opposite
+  error - a journal claiming a step ran when the crash prevented it - and recovery would skip it.
+  For the stage that deletes the envelope, "skip it" means the envelope survives a burn. The
+  first implementation of this had it backwards and the stage-by-stage crash test below caught
+  it, which is the argument for having written those tests;
+- **a damaged journal fails closed**: unreadable, truncated, wrong magic or an unrecognised stage
+  all resolve to the *earliest* stage, so recovery re-runs the whole sequence. Treating a damaged
+  journal as absent would hand anyone who can write to the data directory a one-file way to
+  cancel a burn already committed to;
+- writes are atomic **and durable** - temp file, `fsync`, rename, then `fsync` of the parent
+  directory. `write_file_atomically` only guarantees a reader never sees a torn file; a rename
+  that is not itself synced can be lost by the filesystem on power loss, which would recreate the
+  exact missing-journal case this exists to prevent. (Directory fsync is a Unix idiom and is a
+  no-op on Windows, where NTFS metadata journalling covers the same case.)
+
+## Implemented: replacement identity ("a whole new lockbox")
+
+`burn_identity` optionally takes a replacement passphrase. When given, a brand-new vault is
+provisioned in place once destruction has fully completed, and the application ends up `Locked`
+on that new identity rather than `Destroyed`.
+
+- the replacement shares **nothing** with what it replaces. `provision_new_vault` generates a
+  fresh random vault master key - not derived from the old key, from the new passphrase, or from
+  anything that survived the burn. Reusing the same file paths is a filesystem detail, not a
+  cryptographic relationship: the new database is keyed by a key that did not exist until after
+  the old one was destroyed, so access to the new vault reveals nothing about the old;
+- **provisioning happens strictly after the destruction journal is cleared**, never as a
+  destruction stage. Inside the sequence, a crash between provisioning and clearing the journal
+  would make the next launch resume the burn and destroy the brand-new vault. Afterwards, the
+  worst case is a crash leaving no replacement - recoverable by onboarding normally;
+- a failed replacement never resurrects the destroyed identity: the burn stands, the error says
+  so, and the application stays `Destroyed`;
+- the replacement passphrase is length-validated **before** anything is destroyed, so a typo in
+  an operation with no undo cannot cost the user their data;
+- the replacement does not inherit the destroyed identity's failed-attempt counter.
+
+### What this is not
+
+It is a real, usable, cryptographically unrelated identity. It is **not** a deniability
+mechanism, and the UI does not describe it as one. A replacement vault is a vault with a recent
+creation date and no history; an adversary who knows this software has the feature - it is open
+source - learns nothing from its presence except that Secure is installed. Fabricating a
+*plausible-looking* history to survive coercion is a materially different and much harder
+problem, with a well-documented tendency to leave the user worse off than an obviously-empty
+install, and nothing here attempts it. If a decoy-content mode is ever wanted, it needs its own
+threat-model section, not a quiet extension of this one.
+
+## Implemented: overwrite-before-unlink with a random cover pattern
+
+`shred_file_best_effort` overwrites a file's bytes in place with **random** data and `fsync`s
+that overwrite before unlinking, rather than a bare `fs::remove_file`. Applied to both the
+envelope and the database.
+
+Random rather than zeros, deliberately: a zero-filled run is conspicuous - it advertises that
+something was deliberately erased at that offset. Random bytes are indistinguishable from the
+encrypted content that legitimately occupies these files, so the overwrite is itself the cover,
+and it leaves the freed space looking like ordinary ciphertext rather than like a wiped hole.
+Fresh randomness per 4 KiB chunk, since a single repeated block would be as recognisable a
+pattern as zeros.
+
+Stated honestly, because it is easy to oversell: this raises the bar against trivial undelete and
+file-carving, and it does **not** guarantee the previous bytes are unrecoverable. Copy-on-write
+and journalling filesystems (btrfs, ZFS, ext4 `data=journal`) may retain the old extent; SSD
+wear-levelling and over-provisioning mean the flash translation layer may never reuse the physical
+page; snapshots and backups are outside the process's reach entirely. The real guarantee here
+remains cryptographic - the key material is gone from the only place the application ever wrote
+it - and this is defence in depth on top of that, not a substitute. This does not change the
+project's stated position that Secure does not promise forensic invisibility.
+
+## Implemented: wipe-on-repeated-wrong-passphrase failsafe (`apps/desktop/src-tauri/src/main.rs`)
+
+A concrete trigger for Burn Identity: after `MAX_FAILED_UNLOCK_ATTEMPTS` (3) *consecutive*
+incorrect passphrase attempts against `unlock_application`, `record_failed_unlock_attempt` drives
+`AppLifecycle` through `AppEvent::BeginIdentityBurn` and then `destroy_identity_locked` runs the
+sequence above end-to-end: stop Tor, drop the open vault handle (if any), delete the envelope
+(the security boundary), then best-effort delete the database and the attempt counter itself.
+
+- the attempt count is persisted to a plain file (`vault.attempts`) next to the envelope, not
+  held in memory, specifically so it survives an application restart - the most obvious way an
+  attacker would otherwise try to reset it;
+- a correct passphrase resets the counter to zero, so only a *consecutive* streak of wrong
+  attempts can ever reach the threshold, not a lifetime total across many legitimate sessions;
+- only a wrong passphrase against an otherwise-valid, parseable envelope counts toward the
+  threshold - a missing or corrupt envelope is a different, already-handled failure class, so an
+  attacker cannot force a wipe merely by damaging the envelope file without ever guessing the
+  passphrase;
+- **honest limit, stated in the code, not hidden**: the attempt counter file itself is a plain,
+  unauthenticated integer. Anyone with direct read/write access to the application's data
+  directory can reset or edit it to defeat this failsafe. This does not lower the vault's actual
+  security boundary, because that same level of filesystem access already lets an attacker copy
+  the encrypted database and envelope out for offline attack, or simply delete them - both
+  strictly easier than tampering with a counter file. What this failsafe actually defends
+  against is repeated passphrase guessing *through the application's own unlock command*, which
+  is what "wrong PIN 3 times" means in practice for a desktop application without a secure
+  enclave or OS-backed attempt-throttling to lean on;
+- restart-time orphan cleanup: `AppRuntime::new` now removes any leftover database/attempts
+  file it finds when no envelope exists (e.g. best-effort cleanup partially failed after an
+  earlier burn) - the database is already permanently unreadable by that point regardless, so
+  this is disk hygiene, not a security boundary, matching the "restart only resumes cleanup"
+  test requirement without needing tombstone machinery for a case where there is nothing left to
+  protect.
+
+8 tests in `apps/desktop/src-tauri/src/main.rs` (up from 6) cover: exactly 3 consecutive wrong
+attempts destroys the envelope, database and attempts file and reaches `AppState::Destroyed`;
+2 wrong attempts followed by a correct unlock resets the counter so a further 2 wrong attempts
+do not wipe; the counter survives a simulated application restart (a fresh `AppRuntime` against
+the same directory); a fresh onboarding does not inherit a stale counter left over in the same
+directory; and a destroyed vault can never be unlocked again, even with the original correct
+passphrase.
 
 ## Tests
 
-Inject restart/crash/failure between every pair of stages and verify:
+38 tests now pass in the desktop host (up from 12), 7 of them in `destruction_journal` itself.
+The crash-injection list this section previously described as future work is now exercised.
 
-- old key access never reappears;
-- restart only resumes cleanup;
-- no code path regenerates an envelope for the destroyed identity;
-- final state is terminal;
-- incomplete best-effort filesystem deletion does not invalidate the claim of application-key destruction.
+A real crash cannot be induced from inside a unit test, but what a crash *leaves behind* can be
+reproduced exactly: a journal recording some stage plus the on-disk file state that stage
+implies. Recovery is then driven by constructing a fresh `AppRuntime` against that directory -
+the same code path a real relaunch takes, with no in-memory state carried over.
+
+- `a_burn_interrupted_at_any_stage_resumes_forward_to_destroyed_on_restart` covers **every**
+  stage (`Armed` through `Complete`) and asserts, for each: final state is terminal
+  (`Destroyed`); the envelope is gone; database and attempts file are gone; the journal cleared
+  itself; and the original *correct* passphrase no longer unlocks anything - "old key access
+  never reappears";
+- `a_burn_interrupted_before_key_destruction_still_destroys_the_key_on_restart` isolates the case
+  that matters most, and first proves the envelope really was still openable with the correct
+  passphrase at the simulated moment of the crash - so the test demonstrates recovery being
+  *taken away*, not an already-dead vault;
+- `a_journal_that_understates_progress_re_runs_the_step_harmlessly` covers the other side of the
+  ordering rule: journal one step behind reality, so recovery re-runs a completed step
+  (shredding an already-deleted envelope) and must still reach the terminal state;
+- `a_damaged_journal_cannot_cancel_a_pending_burn`, plus
+  `destruction_journal::tests::a_corrupt_journal_still_means_a_burn_is_pending` over eight
+  distinct forms of damage, and `..._that_cannot_be_read_at_all_...` for a non-file in its place;
+- `a_completed_burn_leaves_a_data_directory_that_looks_like_a_fresh_install` - after the burn and
+  one further relaunch the application offers onboarding and none of the four files exist. This
+  is the "as if it never existed" property stated as an assertion;
+- `recorded_progress_only_ever_moves_forward` pins that a replayed or out-of-order earlier stage
+  cannot rewind the record - "restart only resumes cleanup", at the file level;
+- `every_stage_name_round_trips` guards against a future stage gaining a serialise arm but no
+  deserialise arm, which would silently downgrade a real recorded stage to `Armed`;
+- `the_envelope_is_overwritten_before_it_is_unlinked` hard-links a witness to the same inode so
+  the data outlives the unlink, then asserts the bytes were actually replaced, cover the whole
+  file, and are not an obvious zero fill - pinning that `shred_file_best_effort` neither silently
+  degrades to a plain remove nor leaves a conspicuous erased-here pattern;
+- replacement identity: `a_replacement_identity_takes_the_destroyed_one_s_place` (ends `Locked`,
+  usable, and critically *not* left inside a pending burn that the next launch would resume);
+  `the_destroyed_identity_s_passphrase_is_worthless_against_the_replacement` (different envelope
+  bytes, and the old passphrase is rejected as simply incorrect - the "unrelated lockbox" claim
+  as an assertion); `a_replacement_identity_starts_with_no_history_and_a_clean_attempt_counter`;
+  `a_rejected_replacement_passphrase_destroys_nothing` (validation precedes destruction, so a
+  typo cannot cost data in an operation with no undo);
+  `a_replacement_identity_survives_a_restart_as_a_normal_vault`;
+- `burn_identity_destroys_an_unlocked_vault_on_request` also asserts the open vault handle was
+  dropped (not merely orphaned), so the SQLCipher connection is closed and the vault master key
+  zeroed;
+- `burn_identity_destroys_a_locked_vault_without_needing_the_passphrase`,
+  `burning_an_already_destroyed_identity_is_idempotent`,
+  `burn_identity_is_refused_before_a_vault_exists`;
+- in `secure-core`: `a_resumed_destruction_continues_forward_from_its_recovered_stage` (a stage
+  completed before the crash is not re-applicable - the sequence is monotonic *across* a restart,
+  not merely within one process) and `a_recovered_complete_stage_is_already_terminal`.
+
+"no code path regenerates an envelope for the destroyed identity" holds structurally: the only
+writer of the envelope is `complete_onboarding_impl`, which requires `AppState::Onboarding`, and
+that state is unreachable from `Destroyed` within a process. After a relaunch onboarding *is*
+offered again - correctly, since by then nothing of the destroyed identity remains - and it
+writes a fresh randomly-generated vault master key, not the destroyed one, which no longer exists
+anywhere to regenerate.
+
+## Remaining work
+
+- the destruction journal is unauthenticated, exactly like the attempts counter and for the same
+  reason: authenticating it needs a key that needs the passphrase. This asymmetry is deliberate
+  and safe - an attacker can *create* a journal (forcing a burn of data they already had the
+  access to delete outright) but cannot *cancel* one, because every form of damage resolves to
+  "resume from the earliest stage";
+- Windows behaviour of the directory-fsync no-op and of overwrite-before-unlink on NTFS is
+  reasoned about but not empirically run here, the same category of gap as Phase 1's Windows
+  `mlock` and Phase 2's live Tor bootstrap;
+- Ghost mode is an accepted burn state in the lifecycle but there is no Ghost runtime yet
+  (Phase 7) for that path to be exercised against.
 
 ## Exit criteria
 

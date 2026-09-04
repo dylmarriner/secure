@@ -150,6 +150,25 @@ button:disabled {
   background: #23181c;
 }
 
+.danger {
+  border-color: #8c3a46;
+  background: #3a1a20;
+  color: #ffd9de;
+}
+
+.danger:hover {
+  background: #4a2028;
+}
+
+.danger-panel {
+  border-color: #55262e;
+}
+
+.fineprint {
+  color: #93a0af;
+  font-size: 0.85rem;
+}
+
 .message {
   min-height: 1.5em;
   margin-bottom: 0;
