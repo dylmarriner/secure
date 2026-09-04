@@ -8,9 +8,15 @@ publish = false
 
 [dependencies]
 arti-client = { version = "0.46", default-features = false, features = ["tokio", "rustls"] }
+# tor-rtcompat's "rustls" feature deliberately does not select a crypto backend for the shared
+# rustls instance (their dependency is literally named `rustls-dont-use` internally) - callers
+# are expected to install one themselves via `rustls::crypto::CryptoProvider::install_default`.
+# See `ensure_crypto_provider_installed` in src/lib.rs, and the "ring" vs "aws-lc-rs" choice
+# recorded there.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 thiserror.workspace = true
 tor-rtcompat = { version = "0.46", features = ["tokio", "rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

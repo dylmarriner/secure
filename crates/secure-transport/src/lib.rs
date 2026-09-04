@@ -11,13 +11,15 @@
 //! # What has and has not been exercised
 //!
 //! The [`lifecycle`] state machine (strict-mode enforcement, retry-after-failure, shutdown
-//! semantics) is pure and unit-tested with no network dependency. The real Arti integration in
-//! this file has **not** been exercised in this development environment: it has no outbound
-//! network access, so actually bootstrapping against the live Tor network and actually opening
-//! a stream have never run. It compiles and its types check against the real `arti-client`
-//! 0.46 API (confirmed against that crate's source, not just its docs), but a real bootstrap
-//! run on a machine with network access is still outstanding. See
-//! `docs/implementation-plan.md` Phase 2.
+//! semantics) is pure and unit-tested with no network dependency. The real Arti integration has
+//! now been run against the live Tor network (`tests/live_bootstrap.rs`, `#[ignore]`d by
+//! default since it needs real network access - run explicitly with `cargo test -p
+//! secure-transport --test live_bootstrap -- --ignored`): bootstrap completed in about 30
+//! seconds and a real stream opened to `check.torproject.org:443` over Tor. That run caught a
+//! real bug the first time - see [`ensure_crypto_provider_installed`] - that no amount of
+//! type-checking or network-free unit testing could have found, which is exactly why this
+//! verification mattered rather than being a formality. See `docs/implementation-plan.md`
+//! Phase 2 for when this was actually run and on what.
 //!
 //! # A known upstream risk
 //!
@@ -31,7 +33,7 @@
 mod lifecycle;
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use arti_client::config::TorClientConfigBuilder;
 use arti_client::{TorClient, TorClientConfig};
@@ -69,10 +71,35 @@ pub struct TorTransport {
     config: TorClientConfig,
 }
 
+/// `rustls` 0.23+ requires a process-wide `CryptoProvider` to be installed before any TLS
+/// connection is attempted; it does not pick one automatically once more than zero backends are
+/// reachable in the dependency graph (see the comment on the `rustls` dependency in
+/// `Cargo.toml`) - `arti-client`'s directory client uses TLS to fetch consensus documents from
+/// directory caches, so this has to be installed before `start` ever runs, not just before
+/// `connect`. This was found by actually running a bootstrap against the live Tor network - it
+/// compiled and type-checked without it, and panicked on first real use.
+///
+/// "ring" over "aws-lc-rs": `aws-lc-rs`'s optimised build path additionally wants NASM on
+/// Windows and a C toolchain generally; `ring` avoids adding that requirement on top of what
+/// `secure-storage`'s vendored SQLCipher/OpenSSL build already needs. Both are widely used,
+/// audited TLS crypto backends; this is a build-footprint choice, not a security one.
+static CRYPTO_PROVIDER_INSTALLED: Once = Once::new();
+
+fn ensure_crypto_provider_installed() {
+    CRYPTO_PROVIDER_INSTALLED.call_once(|| {
+        // `install_default` returns `Err` only if a provider was already installed (e.g. by
+        // another crate in the same process, or a previous `TorTransport`); either way there is
+        // nothing left to do, so the result is intentionally ignored.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 impl TorTransport {
     /// Build a transport that will persist Arti's directory cache and persistent state under
     /// `state_dir`/`cache_dir`. Does not start bootstrapping - call [`Self::start`] for that.
     pub fn new(state_dir: &Path, cache_dir: &Path) -> Result<Self, TransportError> {
+        ensure_crypto_provider_installed();
+
         let config = TorClientConfigBuilder::from_directories(state_dir, cache_dir)
             .build()
             .map_err(|error| TransportError::Configuration(error.to_string()))?;

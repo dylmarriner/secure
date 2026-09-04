@@ -4300,6 +4300,7 @@ checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "log",
  "once_cell",
+ "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4495,6 +4496,7 @@ name = "secure-transport"
 version = "0.1.0"
 dependencies = [
  "arti-client",
+ "rustls",
  "thiserror 2.0.20",
  "tor-rtcompat",
 ]

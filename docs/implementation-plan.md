@@ -361,16 +361,25 @@ window since this environment has no display.
 ## What has and has not actually been run
 
 The `TransportLifecycle` state machine is unit-tested (10 tests, network-free). The real Arti
-integration - `TorTransport::new`/`start`/`connect` actually talking to `arti-client` - compiles
-and type-checks against the real 0.46 API (verified against that crate's source directly, not
-just docs.rs summaries, after two rounds of real compiler errors: `TorClient<R>` has no default
-runtime parameter, so `PreferredRuntime` must be named explicitly from `tor_rtcompat`; and
-`TorClientConfigBuilder::from_directories` is an associated function, not a builder method).
-**It has not been run against the live Tor network or exercised a real bootstrap.** This
-development environment has no outbound network access, so that verification is still
-outstanding on a machine that has one - this is analogous to the Windows `mlock` gap from
-Phase 1: type-correct and cross-checked as far as this environment allows, not yet empirically
-run.
+integration has now been **run against the live Tor network and succeeded**
+(`crates/secure-transport/tests/live_bootstrap.rs`, `#[ignore]`d by default since it needs real
+network access - run explicitly with `cargo test -p secure-transport --test live_bootstrap --
+--ignored`): bootstrap completed in ~30 seconds and a real stream opened to
+`check.torproject.org:443` over Tor.
+
+The first attempt did not succeed - it panicked immediately on `start()` with `rustls` refusing
+to pick a `CryptoProvider`. Root cause: `tor_rtcompat`'s `rustls` feature deliberately does not
+select a TLS crypto backend (its dependency for it is literally named `rustls-dont-use`
+internally) - `arti-client`'s directory client uses TLS to fetch consensus documents, and
+nothing in `secure-transport` had ever installed one, because there had never been a real TLS
+handshake to expose the gap. Fixed by adding `rustls` as a direct dependency with the `ring`
+backend explicitly enabled, and calling `rustls::crypto::ring::default_provider().install_default()`
+once in `TorTransport::new` (`ensure_crypto_provider_installed` in `src/lib.rs`) - `ring` over
+`aws-lc-rs` specifically to avoid adding another NASM/C-toolchain build requirement on top of
+`secure-storage`'s vendored SQLCipher/OpenSSL. This is exactly the kind of bug that type-checking
+against the real API surface (which caught the two `PreferredRuntime`/`from_directories` issues
+during initial development) cannot catch: the code was completely well-typed and still could not
+have worked. It took actually running it once against a live network to find.
 
 ## A known upstream risk, documented rather than hidden
 
@@ -390,14 +399,18 @@ only permits one crate in the dependency graph to link the native `sqlite3` libr
 `bundled-sqlcipher-vendored-openssl` feature `secure-storage` depends on, so this was a
 version bump, not a design change. All `secure-storage` tests still pass unmodified.
 
-## Tests (remaining, network-dependent - not yet written)
+## Tests (network-dependent)
 
-- Tor process/task death immediately disables messaging transport (this environment cannot
-  induce a real bootstrap to then kill);
-- DNS leakage tests for supported network paths;
-- restart recovery tests against a real persisted state/cache directory;
-- firewall/proxy integration tests, practical only in CI or a dedicated integration runner with
-  real network access.
+- [x] a real bootstrap against the live Tor network succeeds, and a real stream opens over it
+      (`live_bootstrap.rs`, above);
+- [ ] Tor process/task death immediately disables messaging transport - not yet written; unlike
+      a subprocess-based integration there is no separate OS process to kill here (Arti runs
+      in-process), so this needs a different fault-injection approach than "kill the PID";
+- [ ] DNS leakage tests for supported network paths;
+- [ ] restart recovery tests against a real persisted state/cache directory - `live_bootstrap.rs`
+      uses a fresh temp directory each run, so cache-reuse-on-restart is untested;
+- [ ] firewall/proxy integration tests, practical only in CI or a dedicated integration runner
+      with real network access.
 
 ## Exit criteria
 
