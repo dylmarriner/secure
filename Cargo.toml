@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/secure-attachments",
     "crates/secure-core",
     "crates/secure-crypto",
     "crates/secure-messaging",

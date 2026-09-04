@@ -550,31 +550,73 @@ Two Secure clients can communicate end-to-end through the selected substrate ove
 
 # Phase 4 - Attachment pipeline
 
+**Status:** In progress
+
 ## Objective
 
 Support media/files without turning the filesystem into a plaintext side channel.
 
 ## Work
 
-- independent random encryption key per attachment;
-- authenticated streaming encryption suitable for large files;
-- random opaque ciphertext object names;
-- attachment key stored only inside the encrypted vault;
-- authenticated metadata including content type and expected size;
-- bounded-memory streaming ingest/export;
-- encrypted or transient thumbnails;
-- no automatic external media fetching;
-- safe temporary-view workflow with explicit warning when opening in external applications;
-- attachment cleanup integrated with conversation and identity burn.
+- [x] independent random encryption key per attachment - `AttachmentKey::generate`, a fresh
+      random 256-bit key per call, never derived from the vault master key;
+- [x] authenticated streaming encryption suitable for large files - XChaCha20-Poly1305 under
+      the STREAM online-AEAD construction (`chacha20poly1305::aead::stream`), the same
+      well-reviewed construction tools like `age` use for this exact problem, not invented here;
+- [x] random opaque ciphertext object names - `random_object_name`, a 128-bit random id,
+      lower-hex encoded, matching the naming convention `secure-storage` already uses for
+      record ids;
+- [ ] attachment key stored only inside the encrypted vault - `AttachmentKey`/`from_bytes` are
+      ready for a caller to persist into `attachments.attachment_key`, but nothing yet calls
+      that; `secure-attachments` has no dependency on `secure-storage` (deliberately - encryption
+      primitives and persistence stay separate crates, same boundary discipline as
+      `secure-crypto`/`secure-storage`);
+- [x] authenticated metadata including content type and expected size - both fields live in a
+      header that is itself the AAD for every chunk, so tampering with either invalidates every
+      chunk's authentication tag, not just an adjacent unauthenticated field;
+- [x] bounded-memory streaming ingest/export - exactly one 64 KiB (plaintext) / 64 KiB+16 byte
+      (ciphertext) chunk held at a time; `expected_size` is carried as authenticated metadata,
+      never trusted for allocation;
+- [ ] encrypted or transient thumbnails - not started; this is image-processing work, out of
+      scope for an encryption-primitives crate;
+- no automatic external media fetching: true by construction, this crate has no networking code
+  at all;
+- [ ] safe temporary-view workflow with explicit warning when opening in external applications -
+      UI work, Phase 8;
+- [ ] attachment cleanup integrated with conversation and identity burn - `secure-storage::burn`
+      already destroys `attachments.attachment_key` at the database-row level (Phase 5/6), but
+      deleting the actual on-disk ciphertext object this crate would produce is not wired up
+      anywhere yet, because nothing yet calls `encrypt_stream` against a real file path with a
+      real `random_object_name` - there is no ingest path to wire cleanup to.
 
-## Tests
+## Tests (passing, 11 tests)
 
-- ciphertext mutation fails authentication;
-- filename does not reveal original name;
-- attachment plaintext does not remain in app cache after normal close;
-- burn removes attachment keys before deleting ciphertext;
-- interrupted download/upload cannot be mistaken for a valid complete object;
-- oversized/malformed objects do not exhaust memory.
+- ciphertext mutation fails authentication (`tampered_chunk_content_fails_authentication`);
+- tampering with the authenticated header (content type/size) fails authentication, proving the
+  header is bound into the AAD and not just carried alongside the ciphertext
+  (`tampered_header_fails_authentication`);
+- wrong key fails authentication (`wrong_key_fails_authentication`);
+- filename does not reveal original name - object names are random and unrelated to any
+  filename (`object_names_are_random_and_do_not_reveal_a_filename`);
+- interrupted download/upload cannot be mistaken for a valid complete object - a ciphertext
+  truncated before its properly last-block-flagged final chunk fails authentication rather than
+  decrypting as a shorter-but-valid object, because the STREAM construction binds the
+  last-block flag into the tag (`truncated_ciphertext_is_rejected_not_accepted_as_a_shorter_valid_object`);
+- round-trips at the chunk-size boundary itself: empty, smaller than one chunk, exactly one
+  chunk, and spanning multiple chunks - the exact-multiple-of-chunk-size EOF-detection edge
+  case is real and was worth its own test, not just "large file works";
+- plaintext does not appear anywhere in the raw ciphertext bytes
+  (`plaintext_does_not_appear_anywhere_in_the_ciphertext`);
+- invalid magic/version is rejected as a structurally invalid header before any AEAD work runs
+  (`invalid_magic_is_rejected`).
+
+"Oversized/malformed objects do not exhaust memory" is satisfied by construction rather than by
+a specific test: `expected_size` is read from the (untrusted, attacker-controlled) header but
+never used to size a buffer or pre-allocate anything - the only allocations in the ingest/export
+path are the two fixed-size chunk buffers. "Attachment plaintext does not remain in app cache
+after normal close" and "burn removes attachment keys before deleting ciphertext" are
+integration-level properties that depend on a real ingest path and burn wiring that do not exist
+yet (see "Work" above) - not testable at this crate's level in isolation.
 
 ## Exit criteria
 
