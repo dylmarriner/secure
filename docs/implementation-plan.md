@@ -442,17 +442,40 @@ Create a protocol-neutral Rust interface for:
       `newChatItems` events, restricted to plain-text messages received (not sent) in a direct
       (not group) chat. Anything else inside a `newChatItems` envelope (group messages, files,
       reactions, sent-message echoes) is silently skipped rather than misparsed;
-- [ ] delivery acknowledgement where available;
-- [ ] session/key rotation events;
+- [x] delivery acknowledgement where available - typed as
+      `ChatEvent::MessageDelivery { contact_id, item_id, status }`, parsed from
+      `chatItemsStatusesUpdated` events, restricted to status updates on messages *this client
+      sent* (`chatDir.type == "directSnd"`) in a direct chat. `DeliveryStatus` collapses
+      `CIStatus`'s `sndNew`/`sndSent`/`sndRcvd`/`sndErrorAuth`/`sndError`/`sndWarning` variants
+      into `Pending`/`Sent`/`Received`/`Failed` - the two SimpleX error variants and the warning
+      variant all become `Failed` since a caller needs "delivery did not succeed", not
+      SimpleX's internal agent-error taxonomy, at this boundary. A status update on a *received*
+      item (`directRcv`), a group chat, or a status type this crate does not recognise is
+      silently skipped rather than misparsed, matching the "message receive" scoping above;
+- [ ] session/key rotation events - SimpleX's double-ratchet rotation is internal and automatic;
+      `simplex-chat`'s own bot event reference (`bots/api/EVENTS.md`, checked 2026-09-04) does
+      not surface a ratchet/key-rotation event to bot clients at all, so there is nothing this
+      crate can parse here without inventing an event that does not exist upstream. Left
+      unchecked rather than closed-as-not-applicable until that is re-confirmed against a newer
+      `simplex-chat` release;
 - [ ] attachment transport references;
-- [ ] disconnect / conversation destruction (`SimplexAdapter::shutdown` stops the whole
-      subprocess, which is disconnect-everything, not a per-conversation operation);
+- [x] disconnect (peer-initiated) - typed as
+      `ChatEvent::ContactDisconnected { contact_id, display_name }`, parsed from the
+      `contactDeletedByContact` event. Per `simplex-chat`'s own documentation this fires when
+      *the other party* deletes their side of the connection and conversation history is kept
+      locally; this crate only surfaces the event; deciding what it means for stored
+      conversation state is deferred to whichever later-phase crate owns the vault-backed
+      contact model;
+- [ ] disconnect (local, per-conversation) / conversation destruction -
+      `SimplexAdapter::shutdown` still only stops the whole subprocess (disconnect-everything),
+      not a single conversation; that is Phase 5/6 (Burn Conversation/Identity) territory;
 - [ ] protocol state export into the encrypted vault.
 
 The UI must not depend directly on upstream protocol-specific objects. Enforced structurally:
 `secure-messaging`'s `simplex` module is private (`mod simplex;`, not `pub mod`), so only
 `SimplexAdapter`, `Invitation`, `AdapterError`, `EventReceiver`, `ChatEvent`,
-`IncomingMessage`/`ContactConnected` and `parse_chat_event` - re-exported at the crate root -
+`IncomingMessage`/`ContactConnected`/`ContactDisconnected`/`MessageDelivery` and
+`parse_chat_event` - re-exported at the crate root -
 are visible outside this crate at all. `ChatEvent` itself carries no SimpleX-specific field
 names or types (its `Unrecognised(serde_json::Value)` variant is the one place raw JSON survives
 past this crate's boundary, deliberately, so a caller isn't blocked on this crate parsing every
@@ -561,28 +584,100 @@ Files can be sent, received and viewed through the application without applicati
 
 # Phase 5 - Burn Conversation
 
+**Status:** In progress
+
 ## Objective
 
 Make local conversation destruction a cryptographic operation, not a delete-button animation.
 
 ## Required sequence
 
-1. freeze new sends/receives for the target conversation;
-2. mark the conversation destruction operation as monotonic/in-progress;
-3. destroy protocol/session secrets for the target relationship where supported;
-4. destroy local attachment keys;
-5. remove message/contact relationship records required by the burn scope;
-6. delete encrypted attachment ciphertext best-effort;
-7. persist terminal local destruction state;
-8. optionally request cooperative remote deletion only if the protocol supports it, without representing that request as enforceable.
+1. [x] freeze new sends/receives for the target conversation;
+2. [x] mark the conversation destruction operation as monotonic/in-progress;
+3. [x] destroy protocol/session secrets for the target relationship where supported;
+4. [x] destroy local attachment keys;
+5. [x] remove message/contact relationship records required by the burn scope;
+6. [ ] delete encrypted attachment ciphertext best-effort - not yet applicable, attachment
+       ciphertext storage is Phase 4, not yet implemented;
+7. [x] persist terminal local destruction state;
+8. [ ] optionally request cooperative remote deletion - out of scope for this crate by design
+       (no network access), and there is no messaging-layer caller yet to make the request.
 
-## Tests
+## Implemented (`crates/secure-storage/src/burn.rs`)
 
-- application restart during every destruction stage resumes forward, never backward;
-- destroyed attachment keys cannot be reconstructed from remaining application state;
-- conversation cannot silently reconnect using old session state;
-- repeated burn request is idempotent;
-- remote failure does not undo successful local destruction.
+- `BurnStage` (`Requested -> Frozen -> ProtocolSecretsDestroyed -> AttachmentKeysDestroyed ->
+  RecordsRemoved -> Complete`): a strictly-ordered stage enum where only `BurnStage::next()` can
+  advance it, modelled the same way `secure_core::AppLifecycle`'s `DestructionStage` separates
+  destruction bookkeeping into an explicit state machine rather than an ad-hoc sequence of
+  function calls;
+- `burn_conversation(vault, conversation_id)` drives a conversation's `destruction_tombstones`
+  row (`scope = 'conversation'`, added in the Phase 1 schema specifically for this) from
+  whatever stage it currently holds through to `Complete`, one stage at a time. Each stage's
+  database work and the tombstone's advanced `stage` column commit inside the *same* SQL
+  transaction - the same "transaction-per-step" pattern `migrations.rs` uses - so a crash
+  between stages can never leave the tombstone claiming a stage whose work didn't actually
+  commit;
+- `resume_incomplete_conversation_burns(vault)` finds every tombstone with
+  `scope = 'conversation'` not yet at `Complete` and resumes each from its recorded stage; meant
+  to be called once, early, whenever the vault is opened;
+- stage semantics: `Frozen` sets `conversations.destroyed_at_unix_ms` (a caller such as the
+  future messaging layer is expected to refuse sending/receiving once this is set - this crate
+  has no network path to enforce that itself); `ProtocolSecretsDestroyed` deletes the
+  conversation's `protocol_adapter_state` row, which is the only session/protocol secret this
+  crate currently knows about (`secure-messaging` is not wired to this schema yet - "protocol
+  state export into the encrypted vault" is a still-open Phase 3 item, so any *in-memory*
+  adapter session state is out of this crate's reach today); `AttachmentKeysDestroyed`
+  overwrites every attachment's `attachment_key` with an empty blob *before* `RecordsRemoved`
+  deletes the underlying messages (whose `ON DELETE CASCADE` removes the now-key-less attachment
+  rows too) - "keys before files" applied to database rows, not just filesystem objects;
+  `Complete` persists the terminal marker itself, with no further data changes;
+- the conversation row and its contact are deliberately *not* deleted - `conversations` already
+  had a nullable `destroyed_at_unix_ms` column from the Phase 1 schema for exactly this: a
+  frozen, content-empty tombstone record survives locally (so e.g. a UI can still show "this
+  conversation was destroyed"), while every piece of cryptographic material needed to read its
+  former content or resume its former session is gone;
+- burning a conversation id that does not exist is a reported `StorageError::ConversationNotFound`
+  rather than a silent no-op; a corrupted/unrecognised `stage` value already in the database is
+  `StorageError::CorruptDestructionStage` rather than a panic.
+
+## Tests (passing, `crates/secure-storage/src/burn.rs`)
+
+- a full burn reaches `Complete` (`burn_reaches_complete_and_is_idempotent`);
+- calling burn again on an already-complete conversation is a no-op, not an error and not
+  re-run work (same test) - "repeated burn request is idempotent" from the Phase 5 test list;
+- burning an unknown conversation id fails rather than silently succeeding
+  (`burn_unknown_conversation_is_an_error_not_a_silent_no_op`);
+- an attachment's key is verifiably blanked by the `AttachmentKeysDestroyed` stage *before* the
+  `RecordsRemoved` stage ever runs, checked by driving the stages individually rather than only
+  inspecting the end state (`burn_destroys_attachment_keys_before_removing_rows`) - "destroyed
+  attachment keys cannot be reconstructed from remaining application state";
+- `protocol_adapter_state` for the conversation's contact is deleted by the burn
+  (`burn_deletes_protocol_adapter_state_for_the_contact`) - "conversation cannot silently
+  reconnect using old session state";
+- the conversation row survives as a destroyed-marked tombstone rather than being deleted
+  (`burn_freezes_the_conversation_row_rather_than_deleting_it`);
+- a burn resumed after being interrupted immediately after the `Frozen` stage committed
+  continues forward from `Frozen` (never re-runs `Requested -> Frozen`) and reaches `Complete`
+  (`resuming_from_a_mid_burn_crash_continues_forward_and_completes`) - "application restart
+  during every destruction stage resumes forward, never backward";
+- resuming when nothing is pending is a no-op (`resume_with_nothing_pending_is_a_no_op`);
+- a corrupted stage value already in the database is reported, not panicked on
+  (`corrupt_stage_value_is_reported_not_panicked_on`).
+
+"remote failure does not undo successful local destruction" is not yet applicable: there is no
+remote-deletion request implemented at all yet (sequence step 8), so there is nothing whose
+failure could roll back local state - this crate has no code path that would do so regardless.
+
+## Remaining work
+
+- wire `burn_conversation`/`resume_incomplete_conversation_burns` into the Tauri host once there
+  is a UI affordance to trigger a burn (no `#[tauri::command]` calls into this yet, matching the
+  project's pattern of landing a crate's real logic and tests before wiring it into the host -
+  see `secure-transport`'s own history for the same sequencing);
+- attachment ciphertext cleanup (sequence step 6), once Phase 4 exists to define what that
+  ciphertext even is;
+- cooperative remote deletion (sequence step 8), once a messaging-layer caller exists that could
+  make such a request.
 
 ## Exit criteria
 
@@ -591,6 +686,8 @@ After a completed local burn, the application has no remaining usable local cryp
 ---
 
 # Phase 6 - Burn Identity
+
+**Status:** In progress
 
 ## Objective
 
