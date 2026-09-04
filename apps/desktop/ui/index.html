@@ -78,6 +78,71 @@
         <p id="torMessage" class="message" aria-live="polite"></p>
       </section>
 
+      <!--
+        Shown whenever there is an identity to destroy (locked or unlocked). Deliberately
+        available while locked: someone who no longer has the passphrase must still be able to
+        destroy the data, which is precisely one of the situations this exists for.
+      -->
+      <section id="burnPanel" class="panel danger-panel" hidden>
+        <h2>Destroy this identity</h2>
+        <p>
+          This permanently deletes the key that protects your vault. Every message, contact and
+          attachment on this device becomes undecryptable - by you as well. There is no undo, no
+          recovery phrase and no support route back. Your passphrase will not help afterwards.
+        </p>
+        <p class="fineprint">
+          What this cannot promise: copies already delivered to the people you messaged, data
+          your operating system wrote to swap, hibernation or a crash dump, anything captured by
+          a backup or filesystem snapshot, or bytes retained by your drive's own firmware.
+        </p>
+        <div class="actions">
+          <button id="burnRevealButton" type="button" class="danger">Destroy everything</button>
+        </div>
+        <form id="burnForm" class="vault-form" hidden>
+          <label for="burnConfirm">Type DESTROY to confirm</label>
+          <input
+            id="burnConfirm"
+            name="confirm"
+            type="text"
+            autocomplete="off"
+            spellcheck="false"
+            required
+          />
+
+          <label for="burnReplacement">
+            Start a new identity afterwards (optional) - leave blank to end up with nothing
+          </label>
+          <input
+            id="burnReplacement"
+            name="replacement"
+            type="password"
+            autocomplete="new-password"
+            minlength="12"
+            placeholder="New passphrase, at least 12 characters"
+          />
+          <p class="fineprint">
+            A replacement is a genuinely new vault: a fresh random key that has no relationship
+            to the destroyed one, so its passphrase is unrelated and the old passphrase is simply
+            wrong against it. It starts empty, with no contacts and no history. It is not a
+            disguise - anyone who knows this application knows a new vault can be created at any
+            time, so treat it as starting over, not as a cover story.
+          </p>
+
+          <div class="actions">
+            <button type="submit" class="danger">Destroy permanently</button>
+            <button id="burnCancelButton" type="button">Cancel</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="destroyedPanel" class="panel" hidden>
+        <h2>Identity destroyed</h2>
+        <p>
+          The vault key has been destroyed and the encrypted database removed. Nothing on this
+          device can decrypt the former contents. Restart Secure to set up a new identity.
+        </p>
+      </section>
+
       <p id="message" class="message" aria-live="polite"></p>
 
       <footer>

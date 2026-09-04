@@ -10,12 +10,14 @@
 //!
 //! Implemented: bootstrap (start chat + create the local user), creating and accepting
 //! one-time invitations, sending plain-text messages, the raw chat-event stream, and typed
-//! parsing of the two events this crate currently understands - a plain-text message received
-//! in a direct chat, and a contact connecting - via [`parse_chat_event`]. Not yet implemented,
-//! per the project's "no decorative implementation" rule rather than stubbed: group chat, file
-//! attachments, delivery acknowledgement, session/key rotation events, and exporting protocol
-//! state into the encrypted vault (`secure-storage`). See `docs/implementation-plan.md` Phase 3
-//! for the full adapter-boundary checklist this is working through.
+//! parsing of the four events this crate currently understands - a plain-text message received
+//! in a direct chat, a contact connecting, a contact disconnecting (peer-initiated), and a
+//! delivery-status update for a message this client sent - via [`parse_chat_event`]. Not yet
+//! implemented, per the project's "no decorative implementation" rule rather than stubbed:
+//! group chat, file attachments, session/key rotation events, local (as opposed to
+//! whole-subprocess) conversation disconnect, and exporting protocol state into the encrypted
+//! vault (`secure-storage`). See `docs/implementation-plan.md` Phase 3 for the full
+//! adapter-boundary checklist this is working through.
 //!
 //! # What has and has not actually been run
 //!
@@ -34,7 +36,10 @@ mod simplex;
 
 pub use simplex::adapter::{AdapterError, Invitation, SimplexAdapter};
 pub use simplex::client::EventReceiver;
-pub use simplex::events::{ChatEvent, ContactConnected, IncomingMessage};
+pub use simplex::events::{
+    ChatEvent, ContactConnected, ContactDisconnected, DeliveryStatus, IncomingMessage,
+    MessageDelivery,
+};
 
 /// Parse one raw event value received from an [`EventReceiver`] into zero or more typed
 /// [`ChatEvent`]s - zero when the event's type is recognised but carried nothing this crate

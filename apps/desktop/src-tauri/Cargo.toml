@@ -14,6 +14,7 @@ secure-core = { path = "../../../crates/secure-core" }
 secure-crypto = { path = "../../../crates/secure-crypto" }
 secure-storage = { path = "../../../crates/secure-storage" }
 secure-transport = { path = "../../../crates/secure-transport" }
+rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
 zeroize = { version = "1.9", features = ["zeroize_derive"] }

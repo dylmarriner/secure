@@ -12,6 +12,20 @@ const unlockPassphrase = document.querySelector("#unlockPassphrase");
 const unlockedPanel = document.querySelector("#unlockedPanel");
 const lockButton = document.querySelector("#lockButton");
 
+const destroyedPanel = document.querySelector("#destroyedPanel");
+
+const burnPanel = document.querySelector("#burnPanel");
+const burnRevealButton = document.querySelector("#burnRevealButton");
+const burnForm = document.querySelector("#burnForm");
+const burnConfirm = document.querySelector("#burnConfirm");
+const burnReplacement = document.querySelector("#burnReplacement");
+const burnCancelButton = document.querySelector("#burnCancelButton");
+
+/// Typed confirmation for an irreversible action. A second click is too easy to make by
+/// accident or muscle memory for something with no undo; typing the word forces the user to
+/// read what they are agreeing to.
+const BURN_CONFIRMATION = "DESTROY";
+
 const torStateBadge = document.querySelector("#torStateBadge");
 const startTorButton = document.querySelector("#startTorButton");
 const stopTorButton = document.querySelector("#stopTorButton");
@@ -29,12 +43,24 @@ const PANELS_BY_STATE = {
   onboarding: onboardingPanel,
   locked: lockedPanel,
   unlocked: unlockedPanel,
+  destroyed: destroyedPanel,
 };
+
+// States in which an identity exists to be destroyed. Mirrors the backend's own accepted
+// states for `burn_identity`; the backend refuses anything else regardless of what is shown.
+const BURNABLE_STATES = new Set(["locked", "unlocked"]);
+
+function resetBurnConfirmation() {
+  burnForm.hidden = true;
+  burnRevealButton.hidden = false;
+  burnConfirm.value = "";
+  burnReplacement.value = "";
+}
 
 function renderStatus(status) {
   stateBadge.textContent = status.state;
 
-  for (const panel of [onboardingPanel, lockedPanel, unlockedPanel]) {
+  for (const panel of [onboardingPanel, lockedPanel, unlockedPanel, destroyedPanel]) {
     panel.hidden = true;
   }
 
@@ -42,6 +68,11 @@ function renderStatus(status) {
   if (activePanel) {
     activePanel.hidden = false;
   }
+
+  burnPanel.hidden = !BURNABLE_STATES.has(status.state);
+  // Never leave a primed confirmation form behind across a state change - locking, unlocking or
+  // completing a burn must all return this to its safe, collapsed default.
+  resetBurnConfirmation();
 }
 
 async function refreshStatus() {
@@ -93,6 +124,38 @@ async function lockApplication() {
   }
 }
 
+function revealBurnConfirmation() {
+  burnRevealButton.hidden = true;
+  burnForm.hidden = false;
+  burnConfirm.focus();
+}
+
+async function burnIdentity(event) {
+  event.preventDefault();
+
+  if (burnConfirm.value.trim() !== BURN_CONFIRMATION) {
+    message.textContent = `Type ${BURN_CONFIRMATION} exactly to confirm. Nothing has been destroyed.`;
+    return;
+  }
+
+  // An empty field means "leave nothing behind"; the backend distinguishes null from a string
+  // and validates the length itself before destroying anything.
+  const replacement = burnReplacement.value.length > 0 ? burnReplacement.value : null;
+
+  try {
+    const status = await tauriInvoke()("burn_identity", {
+      replacementPassphrase: replacement,
+    });
+    renderStatus(status);
+    message.textContent = replacement
+      ? "Previous identity destroyed. A new, unrelated vault is now in its place - unlock it with its own passphrase."
+      : "Identity destroyed. The vault key no longer exists.";
+  } catch (error) {
+    resetBurnConfirmation();
+    message.textContent = String(error);
+  }
+}
+
 function renderTorStatus(status) {
   torStateBadge.textContent = status.state;
   const busy = status.state === "bootstrapping";
@@ -138,6 +201,12 @@ async function stopTor() {
 onboardingForm.addEventListener("submit", completeOnboarding);
 unlockForm.addEventListener("submit", unlockApplication);
 lockButton.addEventListener("click", lockApplication);
+burnRevealButton.addEventListener("click", revealBurnConfirmation);
+burnCancelButton.addEventListener("click", () => {
+  resetBurnConfirmation();
+  message.textContent = "";
+});
+burnForm.addEventListener("submit", burnIdentity);
 startTorButton.addEventListener("click", startTor);
 stopTorButton.addEventListener("click", stopTor);
 void refreshStatus();

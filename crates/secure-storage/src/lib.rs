@@ -5,6 +5,7 @@
 //! migrations and providing narrow typed access to encrypted records. It never receives a
 //! human passphrase directly and never falls back to an unencrypted database.
 
+pub mod burn;
 mod migrations;
 #[cfg(test)]
 mod schema;
@@ -37,6 +38,10 @@ pub enum StorageError {
     SchemaTooNew { found: i64, supported: i64 },
     #[error("vault migration to version {version} failed")]
     MigrationFailed { version: i64 },
+    #[error("no conversation exists with the requested id")]
+    ConversationNotFound,
+    #[error("destruction tombstone has an unrecognised stage value: {value}")]
+    CorruptDestructionStage { value: String },
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 }
@@ -111,13 +116,15 @@ impl Vault {
             .query_row("PRAGMA user_version;", [], |row| row.get(0))?)
     }
 
-    /// Direct access to the underlying connection for record-level test helpers.
+    /// Read-only connection access, used only by this crate's own tests (and `burn`'s tests) to
+    /// assert on database state directly.
     #[cfg(test)]
     pub(crate) fn connection(&self) -> &Connection {
         &self.conn
     }
 
-    #[cfg(test)]
+    /// Direct connection access for record-level work within this crate: the typed insert
+    /// helpers in `schema` under `#[cfg(test)]`, and the real [`burn`] module.
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
