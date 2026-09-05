@@ -22,39 +22,19 @@ pub fn start_chat() -> String {
     "/_start".to_owned()
 }
 
-#[derive(Debug, Serialize)]
-struct Profile<'a> {
-    #[serde(rename = "displayName")]
-    display_name: &'a str,
-    #[serde(rename = "fullName")]
-    full_name: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct NewUser<'a> {
-    profile: Profile<'a>,
-    #[serde(rename = "pastTimestamp")]
-    past_timestamp: bool,
-    #[serde(rename = "userChatRelay")]
-    user_chat_relay: bool,
-    #[serde(rename = "clientService")]
-    client_service: bool,
-}
-
-/// `/_create user <json(newUser)>` - create the local user profile.
-pub fn create_user(display_name: &str) -> String {
-    let new_user = NewUser {
-        profile: Profile {
-            display_name,
-            full_name: "",
-        },
-        past_timestamp: false,
-        user_chat_relay: false,
-        client_service: false,
-    };
-    // NewUser/Profile only contain plain strings and bools, so serialisation cannot fail.
-    let json = serde_json::to_string(&new_user).expect("NewUser always serialises");
-    format!("/_create user {json}")
+/// `/user` - `ShowActiveUser`: read back the currently active user profile. This is what
+/// `bootstrap` uses, not `CreateActiveUser` (`/_create user <json>`): the CLI process is always
+/// launched with `--user-display-name` (see `simplex::client::SimplexClient::launch`), which
+/// already creates a profile before the WebSocket server even starts listening.
+/// `CreateActiveUser` was tried first and confirmed, by actually running it against a process
+/// that already had a CLI-created profile, to create a *second*, redundant user and make *that*
+/// one active - not an error, not a reuse of the first. A `create_user`/`CreateActiveUser`
+/// command builder for a genuine future multi-identity flow (creating an additional profile on
+/// an already-running instance, which is a real, different use case from bootstrap) can be
+/// re-added from `bots/api/COMMANDS.md`'s `CreateActiveUser` entry when there is an actual
+/// caller for it - removed here rather than kept unused, per the project's engineering rules.
+pub fn show_active_user() -> String {
+    "/user".to_owned()
 }
 
 /// `/_connect <userId>` with no link argument - `APIAddContact`: create a one-time invitation
@@ -133,12 +113,8 @@ mod tests {
     }
 
     #[test]
-    fn create_user_matches_documented_syntax() {
-        let command = create_user("secure-user");
-        assert_eq!(
-            command,
-            "/_create user {\"profile\":{\"displayName\":\"secure-user\",\"fullName\":\"\"},\"pastTimestamp\":false,\"userChatRelay\":false,\"clientService\":false}"
-        );
+    fn show_active_user_matches_documented_syntax() {
+        assert_eq!(show_active_user(), "/user");
     }
 
     #[test]

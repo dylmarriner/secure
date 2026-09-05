@@ -45,14 +45,21 @@ pub struct SimplexAdapter {
 }
 
 impl SimplexAdapter {
-    /// Launch the `simplex-chat` subprocess and connect to it. Does not bootstrap a user - call
-    /// [`Self::bootstrap`] for that.
+    /// Launch the `simplex-chat` subprocess and connect to it. `display_name` is required at
+    /// launch, not deferred to [`Self::bootstrap`]: the CLI's WebSocket server does not start
+    /// listening until first-run profile setup completes, and with `stdin` closed (as this
+    /// crate deliberately runs it - see `simplex::client::SimplexClient::launch`) that setup
+    /// can only be satisfied by `--user-display-name` at spawn time. This was confirmed by
+    /// actually running it - see that module's docs for what a mismatch between this and
+    /// `bootstrap` looked like in practice (a second, redundant user, not an error).
     pub async fn launch(
         binary_path: PathBuf,
         port: u16,
         database_path: PathBuf,
+        display_name: &str,
     ) -> Result<(Self, EventReceiver), AdapterError> {
-        let (client, events) = SimplexClient::launch(&binary_path, port, &database_path).await?;
+        let (client, events) =
+            SimplexClient::launch(&binary_path, port, &database_path, display_name).await?;
         Ok((
             Self {
                 client,
@@ -62,13 +69,17 @@ impl SimplexAdapter {
         ))
     }
 
-    /// Start the chat controller and create the local user profile. Idempotent in the sense
-    /// that `simplex-chat` itself decides whether a user already exists in the given database
-    /// file; this method always issues both commands and surfaces whatever `simplex-chat`
-    /// reports.
-    pub async fn bootstrap(&self, display_name: &str) -> Result<(), AdapterError> {
+    /// Start the chat controller and read back the active user profile that
+    /// [`Self::launch`]'s `display_name` already created at spawn time.
+    ///
+    /// This calls `ShowActiveUser` (`/user`), not `CreateActiveUser` - the two are not
+    /// interchangeable here. `CreateActiveUser` was confirmed, by actually running it against a
+    /// process that already had a CLI-created profile, to create a *second*, distinct user and
+    /// make *that* active, rather than erroring or reusing the first. `ShowActiveUser` reads
+    /// back the one user that already exists, which is what a bootstrap step should do.
+    pub async fn bootstrap(&self) -> Result<(), AdapterError> {
         self.run(commands::start_chat()).await?;
-        let response = self.run(commands::create_user(display_name)).await?;
+        let response = self.run(commands::show_active_user()).await?;
         let user_id = extract_user_id(&response)?;
         *self.user_id.lock().await = Some(user_id);
         Ok(())

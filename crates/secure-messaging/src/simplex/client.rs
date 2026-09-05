@@ -1,17 +1,33 @@
 //! Process supervision and WebSocket transport for a `simplex-chat -p <port>` subprocess.
 //!
-//! # What has and has not been exercised
+//! # What has been verified against a real binary
 //!
-//! This module has **not** been run against a real `simplex-chat` binary: building the
-//! Haskell `simplex-chat` CLI is impractical in this development environment (no Haskell
-//! toolchain, and building GHC/cabal dependencies from scratch is a multi-hour undertaking even
-//! with network access), so there is nothing to actually launch and connect to here. It
-//! compiles and implements the documented `{corrId, cmd}` / `{corrId, resp}` WebSocket protocol
-//! (see [`crate::simplex::protocol`] and `simplex-chat`'s own `bots/README.md`) faithfully, but
-//! the process-spawn-then-connect sequence, real command/response round trips, and the event
-//! stream have never actually run. This is the same category of gap as `secure-transport`'s
-//! unexercised live Tor bootstrap - type-correct and protocol-correct as far as this
-//! environment allows, not yet empirically run. See `docs/implementation-plan.md` Phase 3.
+//! This module has been run against the real `simplex-chat` v7.0.0.12 CLI (prebuilt
+//! `ubuntu-24_04-x86_64` release binary) and a real spawn-connect-command-response cycle
+//! succeeded. That run found two real bugs that no amount of type-checking against the
+//! documented API could have caught, because both were about the CLI's actual command-line
+//! interface, not its WebSocket protocol:
+//!
+//! - `--database-file <path>` is not a real flag. The real flag is `-d`/`--database <path>`, a
+//!   path *prefix* (the CLI creates `<prefix>_chat.db`/`<prefix>_agent.db` etc. under it), not
+//!   a single file path;
+//! - the WebSocket server does **not** start listening until first-run profile setup
+//!   completes. With `stdin` closed (as this crate deliberately does - see [`SimplexClient::launch`]
+//!   docs above the `Command` construction), an instance with no existing profile exits
+//!   immediately (`hGetLine: end of file`) without ever binding the port, unless
+//!   `--user-display-name` is supplied on the command line to skip the interactive prompt.
+//!
+//! With both fixed, a live run confirmed the exact request/response cycle this crate
+//! implements: `/_start` → `chatRunning`, `/_create user <json>` → `activeUser` (creating a
+//! *second* user distinct from the one `--user-display-name` created at spawn - which is why
+//! [`super::adapter::SimplexAdapter::bootstrap`] uses `/user` (`ShowActiveUser`) instead, to
+//! read back the CLI-created user rather than create a redundant one), and
+//! `/_connect <userId>` → a real `invitation` response with a genuine `simplex:` URI in
+//! `connLinkInvitation.connFullLink`, exactly the field
+//! [`super::adapter`]'s response parsing already expected.
+//!
+//! Not yet run this way: a second instance actually accepting an invitation from the first and
+//! a real end-to-end message round trip. See `docs/implementation-plan.md` Phase 3.
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -60,8 +76,12 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many times to retry connecting to the WebSocket port after spawning the process, and
-/// how long to wait between attempts, while the CLI finishes starting up and binds the port.
-const CONNECT_RETRY_ATTEMPTS: u32 = 20;
+/// how long to wait between attempts, while the CLI finishes starting up, creates its profile
+/// and database, and binds the port. A live run observed the port opening in roughly 3-5
+/// seconds on an otherwise-idle machine; this budget (up to 60 * 250ms = 15s) leaves real
+/// margin above that for a slower disk/first-run database migration rather than cutting it
+/// close to what was merely observed once.
+const CONNECT_RETRY_ATTEMPTS: u32 = 60;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// A running `simplex-chat -p <port>` subprocess and its WebSocket connection.
@@ -82,18 +102,31 @@ pub struct SimplexClient {
 pub type EventReceiver = mpsc::UnboundedReceiver<serde_json::Value>;
 
 impl SimplexClient {
-    /// Launch `simplex-chat -p <port> --database-file <database_path>` and connect to its
-    /// WebSocket server, retrying the connection while the process finishes starting up.
+    /// Launch `simplex-chat -d <database_path> -p <port> -y --user-display-name <display_name>`
+    /// and connect to its WebSocket server, retrying the connection while the process finishes
+    /// starting up.
+    ///
+    /// `-y` (`--yes-migrate`) avoids an interactive confirmation prompt on a schema migration
+    /// after a `simplex-chat` upgrade. `--user-display-name` is not optional despite looking
+    /// like a convenience flag: `stdin` is closed below (`Stdio::null()`), and without an
+    /// existing profile the CLI's WebSocket server never starts listening at all - it blocks on
+    /// an interactive "choose your display name" prompt first. This was found by running it,
+    /// not by reading the CLI's own `--help` output, which does not make that ordering obvious
+    /// - see this module's top-level docs.
     pub async fn launch(
         binary_path: &PathBuf,
         port: u16,
         database_path: &PathBuf,
+        display_name: &str,
     ) -> Result<(Self, EventReceiver), ClientError> {
         let child = Command::new(binary_path)
+            .arg("-d")
+            .arg(database_path)
             .arg("-p")
             .arg(port.to_string())
-            .arg("--database-file")
-            .arg(database_path)
+            .arg("-y")
+            .arg("--user-display-name")
+            .arg(display_name)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
