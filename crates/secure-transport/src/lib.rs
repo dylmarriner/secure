@@ -2,11 +2,9 @@
 //!
 //! This crate embeds [Arti](https://arti.torproject.org), the Tor Project's own pure-Rust Tor
 //! implementation, rather than bundling and supervising the reference C `tor` daemon as a
-//! subprocess. There is no local SOCKS proxy port and no subprocess to launch, sandbox, or
-//! watch for crashes: [`TorTransport::connect`] is the *only* network entry point this crate
-//! exposes. That is a deliberate structural choice, not an oversight - "no clearnet fallback"
-//! is enforced by there being no other function anywhere in this crate that performs network
-//! I/O, rather than by a runtime check that could be bypassed or forgotten elsewhere.
+//! subprocess. [`TorTransport::connect`] is the direct network entry point; callers that cannot
+//! consume an Arti [`DataStream`] (notably the `simplex-chat` subprocess) can start a loopback-only
+//! [`TorSocksProxy`] backed by that same entry point. Neither path contains a clearnet fallback.
 //!
 //! # What has and has not been exercised
 //!
@@ -31,6 +29,7 @@
 //! plans to change it before Secure is described as production-ready.
 
 mod lifecycle;
+mod socks;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, Once};
@@ -42,6 +41,7 @@ use tor_rtcompat::PreferredRuntime;
 
 pub use arti_client::DataStream;
 pub use lifecycle::{TransportEvent, TransportLifecycleError, TransportState};
+pub use socks::TorSocksProxy;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -53,6 +53,10 @@ pub enum TransportError {
     BootstrapFailed(String),
     #[error("failed to establish a connection over Tor: {0}")]
     ConnectFailed(String),
+    #[error("failed to bind the loopback SOCKS proxy: {0}")]
+    SocksBind(#[source] std::io::Error),
+    #[error("failed to read the loopback SOCKS proxy address: {0}")]
+    SocksAddress(#[source] std::io::Error),
     #[error("internal transport lifecycle error: {0}")]
     Lifecycle(#[from] TransportLifecycleError),
     #[error("transport state lock poisoned")]
@@ -66,8 +70,8 @@ pub enum TransportError {
 /// after `Stopped`) is enforced in one place regardless of how many callers hold a reference to
 /// this transport.
 pub struct TorTransport {
-    lifecycle: Mutex<lifecycle::TransportLifecycle>,
-    client: Mutex<Option<Arc<TorClient<PreferredRuntime>>>>,
+    lifecycle: Arc<Mutex<lifecycle::TransportLifecycle>>,
+    client: Arc<Mutex<Option<Arc<TorClient<PreferredRuntime>>>>>,
     config: TorClientConfig,
 }
 
@@ -105,8 +109,8 @@ impl TorTransport {
             .map_err(|error| TransportError::Configuration(error.to_string()))?;
 
         Ok(Self {
-            lifecycle: Mutex::new(lifecycle::TransportLifecycle::new()),
-            client: Mutex::new(None),
+            lifecycle: Arc::new(Mutex::new(lifecycle::TransportLifecycle::new())),
+            client: Arc::new(Mutex::new(None)),
             config,
         })
     }
@@ -147,35 +151,31 @@ impl TorTransport {
         }
     }
 
-    /// The only network entry point this crate exposes. Refuses to run - with no network I/O
+    /// The direct network entry point this crate exposes. Refuses to run - with no network I/O
     /// attempted at all - unless the transport is `Ready`. `target` is host/port, never a raw
     /// IP: `arti_client::IntoTorAddr` is implemented for `(&str, u16)`/`String` pairs, and
     /// deliberately not used here with `DangerouslyIntoTorAddr`, so callers cannot accidentally
-    /// bypass Tor-side name resolution by connecting straight to an IP address.
+    /// bypass Tor-side name resolution by connecting straight to an IP address. The SOCKS bridge
+    /// applies the same restriction to subprocess requests.
     pub async fn connect(&self, host: &str, port: u16) -> Result<DataStream, TransportError> {
-        let client = {
-            let lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|_| TransportError::LockPoisoned)?;
-            if !lifecycle.can_connect() {
-                return Err(TransportError::NotReady {
-                    state: lifecycle.state(),
-                });
-            }
-            self.client
-                .lock()
-                .map_err(|_| TransportError::LockPoisoned)?
-                .clone()
-                .ok_or(TransportError::NotReady {
-                    state: lifecycle.state(),
-                })?
-        };
+        let client = ready_client(&self.lifecycle, &self.client)?;
 
         client
             .connect((host, port))
             .await
             .map_err(|error| TransportError::ConnectFailed(error.to_string()))
+    }
+
+    /// Start a SOCKS5 proxy bound to an operating-system-selected port on IPv4 loopback.
+    ///
+    /// This exists for subprocesses such as `simplex-chat` that can consume a SOCKS proxy but
+    /// cannot consume Arti's [`DataStream`] directly. Starting it before Tor is ready fails
+    /// without binding a listener. Every accepted `CONNECT` request re-checks the shared
+    /// transport lifecycle before opening a Tor stream, so stopping the transport also makes
+    /// the proxy refuse subsequent connections.
+    pub async fn start_socks_proxy(&self) -> Result<TorSocksProxy, TransportError> {
+        ready_client(&self.lifecycle, &self.client)?;
+        TorSocksProxy::start(Arc::clone(&self.lifecycle), Arc::clone(&self.client)).await
     }
 
     /// The current bootstrap progress, if a bootstrap has ever been attempted: `0.0` (just
@@ -215,6 +215,25 @@ impl TorTransport {
     }
 }
 
+fn ready_client(
+    lifecycle: &Mutex<lifecycle::TransportLifecycle>,
+    client: &Mutex<Option<Arc<TorClient<PreferredRuntime>>>>,
+) -> Result<Arc<TorClient<PreferredRuntime>>, TransportError> {
+    let lifecycle = lifecycle.lock().map_err(|_| TransportError::LockPoisoned)?;
+    if !lifecycle.can_connect() {
+        return Err(TransportError::NotReady {
+            state: lifecycle.state(),
+        });
+    }
+    client
+        .lock()
+        .map_err(|_| TransportError::LockPoisoned)?
+        .clone()
+        .ok_or(TransportError::NotReady {
+            state: lifecycle.state(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,6 +258,24 @@ mod tests {
             .connect("example.com", 80)
             .await
             .expect_err("must refuse before start");
+        assert!(matches!(
+            error,
+            TransportError::NotReady {
+                state: TransportState::NotStarted
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn socks_proxy_before_start_refuses_without_binding_a_port() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = TorTransport::new(&dir.path().join("state"), &dir.path().join("cache"))
+            .expect("build transport config");
+
+        let error = transport
+            .start_socks_proxy()
+            .await
+            .expect_err("must refuse before Tor is ready");
         assert!(matches!(
             error,
             TransportError::NotReady {

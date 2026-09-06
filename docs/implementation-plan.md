@@ -282,18 +282,19 @@ Make network access security-enforcing rather than advisory.
 - ~~choose supported Tor integration strategy~~ - **decided: Arti**, the Tor Project's own
   pure-Rust implementation (`arti-client` 0.46), embedded directly rather than bundling and
   supervising the reference C `tor` daemon as a subprocess. No platform binary to package/sign,
-  no subprocess lifecycle to supervise, no local SOCKS port; `TorClient::connect` is called
-  in-process;
+  and no Tor subprocess lifecycle to supervise; `TorClient::connect` is called in-process;
 - start and supervise Tor from Rust - `TorTransport::start` calls
   `TorClient::create_bootstrapped`;
 - expose only narrowly scoped access to the messaging layer - `TorTransport::connect` is the
-  *only* network entry point `secure-transport` exposes; there is no other function anywhere in
-  the crate that performs network I/O;
+  direct entry point, and `TorTransport::start_socks_proxy` exposes a loopback-only SOCKS5
+  bridge for subprocesses (specifically `simplex-chat`) that cannot consume an Arti stream;
+  both route through the same ready-state gate and Arti client, with no clearnet fallback;
 - prohibit WebView direct networking - unchanged from Phase 0 (`connect-src 'none'` CSP; no
   networking capability granted to the WebView);
 - prohibit direct DNS resolution for messaging destinations - `connect` only accepts
   `(host, port)` via `arti_client::IntoTorAddr`, never `DangerouslyIntoTorAddr`'s raw-IP
-  variants, so a caller cannot bypass Tor-side name resolution;
+  variants, and the SOCKS bridge rejects raw-IP requests, so neither caller can bypass Tor-side
+  name resolution;
 - implement bootstrap state, failure state and retry policy - see `TransportState` below;
 - implement strict-mode network state machine - see `TransportLifecycle` below;
 - ensure transport errors never fall back to clearnet - structural, not a runtime check: this
@@ -357,15 +358,25 @@ window since this environment has no display.
 - `bootstrap_fraction()` exposes `TorClient::bootstrap_status().as_frac()` for a future status
   indicator; nothing in this crate uses it to decide whether to allow a connection - that
   decision belongs to `TransportLifecycle::can_connect()` alone.
+- `TorSocksProxy` (`src/socks.rs`): binds only to an OS-selected IPv4 loopback port, accepts
+  SOCKS `CONNECT` requests via Arti's own `tor-socksproto` parser, rejects raw-IP destinations
+  so hostname resolution remains inside Tor, and re-checks the shared transport lifecycle for
+  every new request. Dropping or shutting down its handle aborts the listener and active relay
+  tasks. This is the bridge the `simplex-chat` subprocess requires; it does not create a second
+  Tor implementation or a direct-network path.
 
 ## What has and has not actually been run
 
-The `TransportLifecycle` state machine is unit-tested (10 tests, network-free). The real Arti
+The transport lifecycle/strict-mode surface is unit-tested (11 tests, network-free). The real Arti
 integration has now been **run against the live Tor network and succeeded**
 (`crates/secure-transport/tests/live_bootstrap.rs`, `#[ignore]`d by default since it needs real
 network access - run explicitly with `cargo test -p secure-transport --test live_bootstrap --
 --ignored`): bootstrap completed in ~30 seconds and a real stream opened to
 `check.torproject.org:443` over Tor.
+
+That same ignored live test now also starts the loopback SOCKS bridge, performs a real SOCKS5
+handshake, and opens `check.torproject.org:443` through the bridge. The direct stream and
+subprocess-compatible paths are therefore both empirically exercised against the live network.
 
 The first attempt did not succeed - it panicked immediately on `start()` with `rustls` refusing
 to pick a `CryptoProvider`. Root cause: `tor_rtcompat`'s `rustls` feature deliberately does not
@@ -508,7 +519,7 @@ checked against `simplex-chat/simplex-chat`'s generated `bots/api/COMMANDS.md`/`
 (`stable` branch, 2026-09-04) rather than guessed; `simplex::adapter::SimplexAdapter` ties it
 together into the narrow public surface above.
 
-27 tests cover everything that does not require a live `simplex-chat` process: every command
+34 tests cover everything that does not require a live `simplex-chat` process: every command
 string is checked against the documented syntax (`simplex::commands`), the `corrId` correlation
 bookkeeping is checked including the stale-response-after-dropped-waiter case
 (`simplex::protocol`), response-shape parsing is checked against realistic sample JSON matching
@@ -517,16 +528,19 @@ against realistic sample JSON matching the documented event shapes, including th
 cases - a sent-message echo, a group message, non-text content - that must be silently skipped
 rather than misparsed as an incoming direct text message (`simplex::events`).
 
-**What has not been run:** the actual process-spawn-then-WebSocket-connect sequence and any
-real command/response round trip. Building the Haskell `simplex-chat` CLI is impractical in
-this development environment (no Haskell toolchain; building GHC/cabal dependencies from
-scratch is a multi-hour undertaking even with network access). This is the same category of gap
-as `secure-transport`'s unexercised live Tor bootstrap: type-correct and protocol-correct as
-far as this environment allows, confirmed against upstream's own generated API reference rather
-than assumed, but not yet empirically run. Verifying this against a real `simplex-chat` binary
-on a machine that can build or install one is the natural next step before this phase can be
-called done, and before `secure-messaging` is wired into the Tauri host the way
-`secure-storage`/`secure-crypto`/`secure-transport` were.
+The actual process-spawn/WebSocket path and a command/response cycle have now been run against
+the official `simplex-chat` v7.0.0 Linux release binary. That run found and fixed the incorrect
+database flag and missing first-run display-name argument; the ignored live test preserves the
+launch/bootstrap/invitation check. `SimplexAdapter::launch`/`SimplexClient::launch` now also
+require a database encryption key (`-k`/`--key`, refused if empty rather than silently launching
+an unencrypted database) and a SOCKS proxy address (`--socks-proxy`, mandatory rather than
+optional, so there is no clearnet-capable launch path) - both flags checked against
+`simplex-chat`'s own `Simplex.Chat.Options`/`Simplex.Chat.Options.Sqlite` source rather than
+guessed. What remains unverified is a two-client contact and message round trip against a live
+proxy, and the adapter is still not wired into the host (`apps/desktop/src-tauri`) - that wiring
+needs to combine the transport crate's `TorTransport::start_socks_proxy` lifetime with the
+messaging crate's process lifetime and expose a narrow Tauri command surface, which is its own
+piece of work, not a byproduct of this one.
 
 ## Contact model
 

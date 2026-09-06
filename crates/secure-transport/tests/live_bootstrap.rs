@@ -17,12 +17,15 @@
 use std::time::Duration;
 
 use secure_transport::TorTransport;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::time::timeout;
 
 /// Generous but bounded: real Tor bootstrap over a healthy network link typically completes in
 /// well under a minute; this leaves headroom for a slow link without hanging a CI run forever
 /// if this were ever accidentally left un-ignored.
 const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(180);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::test]
 #[ignore = "requires real outbound network access to the live Tor network"]
@@ -43,6 +46,42 @@ async fn bootstraps_and_connects_over_the_real_tor_network() {
         .await
         .expect("must be able to open a stream over Tor once Ready");
     drop(stream);
+
+    let proxy = transport
+        .start_socks_proxy()
+        .await
+        .expect("must start loopback SOCKS proxy once Tor is ready");
+    let mut socket = TcpStream::connect(proxy.address())
+        .await
+        .expect("must connect to loopback SOCKS proxy");
+    socket
+        .write_all(&[5, 1, 0])
+        .await
+        .expect("write SOCKS greeting");
+    let mut greeting = [0_u8; 2];
+    socket
+        .read_exact(&mut greeting)
+        .await
+        .expect("read SOCKS greeting response");
+    assert_eq!(greeting, [5, 0]);
+
+    let host = b"check.torproject.org";
+    let mut request = vec![5, 1, 0, 3, host.len() as u8];
+    request.extend_from_slice(host);
+    request.extend_from_slice(&443_u16.to_be_bytes());
+    socket
+        .write_all(&request)
+        .await
+        .expect("write SOCKS request");
+    let mut response = [0_u8; 10];
+    timeout(CONNECT_TIMEOUT, socket.read_exact(&mut response))
+        .await
+        .expect("SOCKS connect must not hang")
+        .expect("read SOCKS connect response");
+    assert_eq!(response[0], 5);
+    assert_eq!(response[1], 0, "SOCKS proxy must open the stream over Tor");
+
+    proxy.shutdown().await;
 
     transport.stop().expect("stop");
 }

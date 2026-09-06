@@ -11,6 +11,20 @@
 //! - `--database-file <path>` is not a real flag. The real flag is `-d`/`--database <path>`, a
 //!   path *prefix* (the CLI creates `<prefix>_chat.db`/`<prefix>_agent.db` etc. under it), not
 //!   a single file path;
+//! - the database is encrypted with `-k`/`--key <KEY>` (`Simplex.Chat.Options.Sqlite.chatDbOptsP`
+//!   upstream - confirmed against that source, not guessed), which this crate always supplies:
+//!   an unencrypted `simplex-chat` database would put message/session state on disk in plaintext,
+//!   which is exactly the "no application-controlled plaintext persistence" invariant the rest of
+//!   this workspace (`secure-storage`'s SQLCipher vault) is built around. There is no environment
+//!   variable or key-file alternative upstream, only this CLI flag, so the key is visible in this
+//!   process's argv (e.g. via `/proc/<pid>/cmdline`) to anything else able to read it - the same
+//!   exposure any CLI tool taking a secret as an argument has; there is no more private way to
+//!   hand this specific upstream binary a key;
+//! - the SOCKS proxy is `--socks-proxy <ipv4:port>` (`Simplex.Chat.Options.chatOptsP` upstream),
+//!   which this crate always supplies pointed at the caller's Tor SOCKS bridge
+//!   (`secure_transport::TorTransport::start_socks_proxy`) rather than making it optional: an
+//!   optional proxy is a clearnet-fallback footgun, and this crate's only job per
+//!   `docs/security-architecture.md` is Tor-only transport;
 //! - the WebSocket server does **not** start listening until first-run profile setup
 //!   completes. With `stdin` closed (as this crate deliberately does - see [`SimplexClient::launch`]
 //!   docs above the `Command` construction), an instance with no existing profile exits
@@ -29,6 +43,7 @@
 //! Not yet run this way: a second instance actually accepting an invitation from the first and
 //! a real end-to-end message round trip. See `docs/implementation-plan.md` Phase 3.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -41,11 +56,14 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use zeroize::Zeroizing;
 
 use super::protocol::{CommandEnvelope, CorrelationTable, IncomingEnvelope};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
+    #[error("database encryption key must not be empty")]
+    EmptyDatabaseKey,
     #[error("failed to spawn the simplex-chat process: {0}")]
     Spawn(#[source] std::io::Error),
     #[error(
@@ -102,28 +120,42 @@ pub struct SimplexClient {
 pub type EventReceiver = mpsc::UnboundedReceiver<serde_json::Value>;
 
 impl SimplexClient {
-    /// Launch `simplex-chat -d <database_path> -p <port> -y --user-display-name <display_name>`
-    /// and connect to its WebSocket server, retrying the connection while the process finishes
-    /// starting up.
+    /// Launch
+    /// `simplex-chat -d <database_path> -k <database_key> -p <port> --socks-proxy <socks_proxy>
+    /// -y --user-display-name <display_name>` and connect to its WebSocket server, retrying the
+    /// connection while the process finishes starting up.
     ///
-    /// `-y` (`--yes-migrate`) avoids an interactive confirmation prompt on a schema migration
-    /// after a `simplex-chat` upgrade. `--user-display-name` is not optional despite looking
-    /// like a convenience flag: `stdin` is closed below (`Stdio::null()`), and without an
-    /// existing profile the CLI's WebSocket server never starts listening at all - it blocks on
-    /// an interactive "choose your display name" prompt first. This was found by running it,
-    /// not by reading the CLI's own `--help` output, which does not make that ordering obvious
-    /// - see this module's top-level docs.
+    /// `database_key` and `socks_proxy` are required, not optional: an empty key would leave
+    /// `simplex-chat`'s own database unencrypted, and there is no clearnet-fallback mode for the
+    /// SOCKS proxy - see this module's top-level docs for why each flag is what it is. `-y`
+    /// (`--yes-migrate`) avoids an interactive confirmation prompt on a schema migration after a
+    /// `simplex-chat` upgrade. `--user-display-name` is not optional despite looking like a
+    /// convenience flag: `stdin` is closed below (`Stdio::null()`), and without an existing
+    /// profile the CLI's WebSocket server never starts listening at all - it blocks on an
+    /// interactive "choose your display name" prompt first. This was found by running it, not by
+    /// reading the CLI's own `--help` output, which does not make that ordering obvious - see
+    /// this module's top-level docs.
     pub async fn launch(
         binary_path: &PathBuf,
         port: u16,
         database_path: &PathBuf,
+        database_key: &Zeroizing<String>,
+        socks_proxy: SocketAddr,
         display_name: &str,
     ) -> Result<(Self, EventReceiver), ClientError> {
+        if database_key.is_empty() {
+            return Err(ClientError::EmptyDatabaseKey);
+        }
+
         let child = Command::new(binary_path)
             .arg("-d")
             .arg(database_path)
+            .arg("-k")
+            .arg(database_key.as_str())
             .arg("-p")
             .arg(port.to_string())
+            .arg("--socks-proxy")
+            .arg(socks_proxy.to_string())
             .arg("-y")
             .arg("--user-display-name")
             .arg(display_name)
@@ -234,5 +266,31 @@ impl SimplexClient {
     pub async fn shutdown(mut self) {
         self.reader_task.abort();
         let _ = self.child.kill().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn launch_refuses_an_empty_database_key_without_spawning_a_process() {
+        // A binary path that cannot possibly exist proves this is rejected before `Command::spawn`
+        // is ever reached, not merely that spawning something eventually fails.
+        let binary_path = PathBuf::from("/nonexistent/simplex-chat-binary-for-this-test");
+        let database_path = PathBuf::from("/tmp/does-not-matter");
+        let socks_proxy: SocketAddr = "127.0.0.1:9050".parse().expect("valid socket address");
+
+        let result = SimplexClient::launch(
+            &binary_path,
+            0,
+            &database_path,
+            &Zeroizing::new(String::new()),
+            socks_proxy,
+            "test",
+        )
+        .await;
+
+        assert!(matches!(result, Err(ClientError::EmptyDatabaseKey)));
     }
 }

@@ -10,10 +10,12 @@
 //! the right way to close that gap when there is a real caller for it - see
 //! `docs/implementation-plan.md` Phase 3.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
+use zeroize::Zeroizing;
 
 use super::client::{ClientError, EventReceiver, SimplexClient};
 use super::commands::{self, ChatKind};
@@ -52,14 +54,32 @@ impl SimplexAdapter {
     /// can only be satisfied by `--user-display-name` at spawn time. This was confirmed by
     /// actually running it - see that module's docs for what a mismatch between this and
     /// `bootstrap` looked like in practice (a second, redundant user, not an error).
+    ///
+    /// `database_key` and `socks_proxy` are both mandatory, for the same reason they are
+    /// mandatory on `SimplexClient::launch`: an unencrypted `simplex-chat` database or a
+    /// clearnet-capable launch would violate this workspace's encrypted-storage and
+    /// Tor-only-transport invariants respectively (`docs/security-architecture.md`). The caller
+    /// is expected to pass the address of a running
+    /// `secure_transport::TorTransport::start_socks_proxy` bridge - this crate does not depend
+    /// on `secure-transport` directly so that the SimpleX/Tor boundary stays a caller-composed
+    /// wire-up rather than a cross-crate dependency.
     pub async fn launch(
         binary_path: PathBuf,
         port: u16,
         database_path: PathBuf,
+        database_key: Zeroizing<String>,
+        socks_proxy: SocketAddr,
         display_name: &str,
     ) -> Result<(Self, EventReceiver), AdapterError> {
-        let (client, events) =
-            SimplexClient::launch(&binary_path, port, &database_path, display_name).await?;
+        let (client, events) = SimplexClient::launch(
+            &binary_path,
+            port,
+            &database_path,
+            &database_key,
+            socks_proxy,
+            display_name,
+        )
+        .await?;
         Ok((
             Self {
                 client,

@@ -23,14 +23,17 @@
 //!
 //! [`simplex::commands`] (the exact command strings sent to `simplex-chat`) and
 //! [`simplex::protocol`] (the `corrId` request/response correlation bookkeeping) are pure and
-//! unit-tested against `simplex-chat`'s own documented API reference, with no process or
-//! network dependency. The process-spawn-and-WebSocket-connect path in [`simplex::client`] and
-//! the response-shape parsing in [`simplex::adapter`] have **not** been run against a real
-//! `simplex-chat` process: building the Haskell `simplex-chat` CLI is impractical in this
-//! development environment. They compile and follow the documented protocol/response shapes as
-//! confirmed against `simplex-chat/simplex-chat`'s `bots/api/COMMANDS.md` and `TYPES.md`
-//! (`stable` branch, 2026-09-04), not guessed - but that is not the same as having been
-//! empirically run. See `docs/implementation-plan.md` Phase 3.
+//! unit-tested against `simplex-chat`'s own documented API reference. The process spawn,
+//! WebSocket connection, bootstrap and invitation path has also been run against the official
+//! `simplex-chat` v7.0.0 Linux release and is preserved as an ignored live test. A two-client
+//! contact/message round trip remains outstanding; see `docs/implementation-plan.md` Phase 3.
+//!
+//! [`SimplexAdapter::launch`] requires a database encryption key and a SOCKS proxy address,
+//! checked against `simplex-chat`'s own `Simplex.Chat.Options`/`Simplex.Chat.Options.Sqlite`
+//! source (`-k`/`--key`, `--socks-proxy`) rather than assumed: an empty key or a missing proxy
+//! would silently reintroduce, respectively, a plaintext protocol database and a clearnet
+//! fallback path - exactly what this workspace's encrypted-storage and Tor-only-transport
+//! invariants exist to prevent.
 
 mod simplex;
 
