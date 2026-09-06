@@ -1,284 +1,258 @@
 # Secure Backup and Snapshot Hardening
 
-## Purpose
+## Status
 
-Secure must be designed so that ordinary backup, sync, filesystem-snapshot, and disk-image mechanisms do not create a second recoverable copy of sensitive application state that survives Burn Identity.
+This document defines mandatory security requirements for Secure. Snapshot/backup resistance requested by the product owner is not an optional tier, convenience feature, or best-effort substitute for the real destruction invariant.
 
-This is a security objective, not a claim that an unprivileged application can prevent the operating system, an administrator, a hypervisor, storage firmware, or a forensic acquisition tool from copying bytes. Secure must not claim that it is impossible to snapshot, image, clone, or back up the host.
+Secure MUST NOT ship a supported production identity mode that allows a pre-burn copy of Secure's application-controlled data to resurrect a destroyed identity.
 
-The stronger and defensible requirement is:
+See `docs/self-destruct-semantics.md` for the canonical Burn / Self-Destruct behavior.
 
-> After the cryptographic-destruction boundary completes, a previously captured copy of Secure's application-controlled encrypted state must not be sufficient by itself to recover the destroyed identity. Secure must minimize participation in ordinary backup/sync systems, persist no plaintext message/session state, and make recovery of old ciphertext depend on secret material that is intentionally destroyed during Burn Identity.
+## Required security property
 
-Residual ciphertext may still exist in filesystem snapshots, volume images, cloud/device backups, storage-controller remapping, or other layers outside Secure's control. Those copies are treated as hostile archival copies and must remain useless without the destroyed key hierarchy.
+> After Burn / Self-Destruct completes, restoring any pre-burn copy of Secure's application-controlled persistent state MUST NOT restore the destroyed identity, even when the attacker knows the old correct passphrase.
+
+Secure may be copied, imaged, snapshotted, or backed up by privileged software. The application cannot stop an administrator, hypervisor, kernel, filesystem, storage controller, or forensic tool from copying bytes. Secure therefore treats every such copy as a hostile archival copy and makes the copied bytes insufficient to recover a destroyed identity.
+
+Residual ciphertext may remain in snapshots, disk images, cloud/device backups, filesystem history, storage-controller remapping, or other layers outside Secure's control. Those copies MUST remain useless without key material that Burn permanently invalidates.
 
 ---
 
-# Security model
+# Threats in scope
 
-## Threats in scope
-
-Secure must account for:
+Secure MUST account for:
 
 - ordinary file backup tools copying the application data directory;
-- cloud/roaming profile backup of application data;
-- filesystem snapshots such as copy-on-write snapshots;
-- full-volume or full-disk images;
-- backup software that captures files while Secure is locked or unlocked;
-- stale copies of `vault.key`, `vault.db`, SimpleX databases, encrypted attachments, migration files, caches, temporary files, and configuration;
-- a snapshot taken before Burn Identity and inspected after Burn Identity;
-- an attacker obtaining the user's passphrase after Burn Identity;
-- restoration of an old application-data directory onto the same machine after Burn Identity.
+- cloud or roaming-profile backup of application data;
+- copy-on-write filesystem snapshots;
+- full-volume and full-disk images that do not include live RAM/device-secret state;
+- backup software capturing files while Secure is locked or unlocked;
+- stale copies of `vault.key`, `vault.db`, SimpleX databases, encrypted attachments, migrations, caches, temporary files, and configuration;
+- a snapshot taken before Burn and inspected after Burn;
+- an attacker learning the old passphrase after Burn;
+- restoring an old application-data directory onto the same machine after Burn;
+- attempting to roll the automatic replacement identity backward to the destroyed generation.
 
-## Threats outside an application-only guarantee
+## Boundary outside an application-only guarantee
 
-Secure cannot guarantee protection when an attacker captured enough live system state to include the active decryption secrets, for example:
+Secure cannot retroactively destroy an independent copy of an active secret that an attacker already captured outside Secure's persistent storage boundary, for example:
 
-- RAM or process-memory capture while Secure was unlocked;
-- a VM snapshot that includes guest RAM and virtual TPM/secure-hardware state;
-- kernel, debugger, EDR, or administrator access capable of reading active process secrets;
-- a backup/export explicitly created by the user that intentionally includes independent recovery key material;
-- compromise of hardware or firmware that exposes a supposedly non-exportable device secret.
+- RAM/process-memory capture while Secure is unlocked;
+- VM snapshot containing guest RAM and the complete virtual-TPM/security-device state;
+- kernel/debugger/EDR/administrator capture of active secret material;
+- compromise of security hardware/firmware that exposes a supposedly non-exportable secret.
 
-These limits must remain explicit in product and security documentation.
+These limits MUST remain explicit. They do not weaken the mandatory disk/application-state rollback requirement above.
 
 ---
 
-# Required architecture
+# Mandatory architecture
 
-## 1. Backups must never be the recovery mechanism
+## 1. Backups are never identity recovery
 
-Secure must not silently use system/cloud backup as identity recovery.
+Secure MUST NOT silently use system/cloud backup as identity recovery.
 
 - No automatic cloud backup of identities, message databases, attachment keys, or recovery secrets.
-- No roaming-profile sync of security-critical state where the platform provides a non-roaming/local storage location.
+- No roaming-profile sync of security-critical state.
 - No application-managed remote backup by default.
-- Any future explicit user export must be a separate, deliberately encrypted recovery artifact with its own threat model and must never be created automatically.
+- Any future explicit export MUST be a separate intentionally encrypted artifact with a separately approved threat model. It MUST NOT weaken Burn semantics.
 
-## 2. Best-effort platform backup exclusion
+## 2. Exclude Secure from ordinary backup/sync paths
 
-For every supported platform, Secure must use the strongest supported, documented mechanism to mark or place application-controlled sensitive data outside ordinary backup/sync scope where such a mechanism exists.
+For every supported production platform, Secure MUST use the strongest documented mechanism available to place or mark sensitive application state outside normal backup and roaming-sync scope.
 
-This is defence in depth only. A privileged backup product, administrator, filesystem snapshot, disk image, or hypervisor can ignore application preferences.
+This is defence in depth, not the core guarantee. A privileged backup product may ignore the exclusion, and the cryptographic design MUST remain secure when it does.
 
-Release documentation must record, per platform:
+Release documentation MUST record:
 
-- the application data directory used;
-- whether it is local/non-roaming;
-- which backup-exclusion mechanism is applied;
-- which backup/snapshot mechanisms can ignore that exclusion;
-- the test used to prove the normal backup path does not collect Secure data.
+- the sensitive application-data directory;
+- the local/non-roaming placement used;
+- backup-exclusion mechanisms applied;
+- known mechanisms capable of ignoring the exclusion;
+- release tests proving normal backup paths do not collect Secure state.
 
-Secure must not disable operating-system backup services, tamper with unrelated snapshots, wipe system restore data, or attempt to evade forensic/EDR tooling. The security boundary is cryptographic, not hostile modification of the host.
+Secure MUST NOT disable unrelated OS backups, delete unrelated snapshots, tamper with restore points, or interfere with forensic/EDR systems.
 
-## 3. Snapshot-resistant key hierarchy
+## 3. Device-bound destruction secret is mandatory
 
-A filesystem snapshot can preserve an old copy of the vault envelope. Therefore deleting only the current `vault.key` file is insufficient to make a *pre-burn snapshot* useless if that snapshot contains everything needed to unwrap the VMK.
+The human passphrase and files inside Secure's application-data directory MUST NOT be sufficient to recover an identity after Burn.
 
-Where supported, Secure must add a device-bound destruction secret that is not stored as recoverable plaintext inside the application data directory.
+Secure's production key hierarchy MUST include a device-bound destruction secret or equivalent non-exportable platform security primitive whose valid state is outside the normal snapshot-able application-data set.
 
-Target hierarchy:
+Target construction:
 
 ```text
 human passphrase
       |
    Argon2id
       |
-passphrase wrapping key
+passphrase-derived wrapping input
       |
-      +---------------------+
-                            |
-                device-bound destruction secret
-                (prefer non-exportable hardware-backed key)
-                            |
-                  vault-unwrapping construction
-                            |
-                  random vault master key
-                            |
-        +-------------------+-------------------+
-        |                   |                   |
- SQLCipher vault     SimpleX DB key      local config key
-                                                |
-                                      independent attachment keys
+      +------------------------+
+                               |
+                  device-bound destruction secret
+                  non-exportable / platform protected
+                               |
+                     reviewed key-wrapping/KDF design
+                               |
+                     random vault master key
+                               |
+        +----------------------+------------------+
+        |                      |                  |
+ Secure SQLCipher key   SimpleX DB key    local-config key
+                                                   |
+                                         attachment/session keys
 ```
 
-The exact composition must be cryptographically reviewed before implementation. Do not invent an ad-hoc combining primitive. Use a standard KDF/wrapping construction with explicit domain separation.
+The exact combining construction MUST use a reviewed standard KDF/wrapping design with explicit domain separation. Secure MUST NOT invent an ad-hoc cryptographic combiner.
 
-### Desired property
+## 4. No silent software-only downgrade
 
-A copied `vault.key`/`vault.db` pair plus the human passphrase must not be sufficient to recover the vault after the device-bound destruction secret has been destroyed.
+If Secure cannot establish the required device-bound destruction/anti-rollback primitive on a machine, it MUST fail closed for supported production identity provisioning.
 
-This is the main mechanism that makes old ordinary disk/file snapshots materially less useful after Burn Identity.
+It MUST NOT silently fall back to a mode where an old application-data snapshot plus the old passphrase can restore a burned identity.
 
-## 4. Hardware-backed secret where available
+Unsupported/development configurations may exist only if they are unmistakably non-production and cannot be mistaken for satisfying the Secure destruction guarantee.
 
-Prefer a non-exportable, machine-bound key held by supported platform security hardware/services.
+## 5. Anti-rollback identity generation is mandatory
 
-Requirements:
-
-- private key/secret material must not be exportable through Secure's normal API;
-- application storage may contain only the public metadata/wrapped blob needed to ask the device security boundary to unwrap;
-- Burn Identity destroys or invalidates the device-bound key before ordinary ciphertext cleanup is considered complete;
-- restoring an old application-data snapshot after burn must fail because the old wrapped state still depends on the destroyed device key;
-- Secure must detect and report when hardware-backed protection is unavailable rather than silently claiming the same snapshot-resistance level.
-
-A software-only fallback may still provide strong encrypted-at-rest protection, but it must be labelled as a weaker snapshot-resistance tier.
-
-Virtual machines require separate treatment because a VM snapshot can include virtual-TPM state. Secure must not claim hardware-backed snapshot resistance inside a VM unless the deployment architecture proves that the relevant hardware/secret state is outside the snapshot boundary.
-
-## 5. Key epochs and anti-rollback state
-
-Old snapshots must not be accepted merely because their files are internally valid.
-
-Introduce a monotonic identity/key epoch tied to the device-bound security boundary where technically feasible:
+Each identity MUST have a device-bound generation/epoch that cannot be rolled backward merely by replacing the application-data directory.
 
 ```text
 identity generation 41 -> active
-Burn Identity
-identity generation 41 -> permanently invalid
-replacement identity -> generation 42
+Burn 41
+41 -> permanently invalid
+fresh replacement -> generation 42
 ```
 
-On startup, restoring an older application-data snapshot must fail closed if its cryptographic epoch is older than the device-bound current/invalidated state.
+On startup, application state whose generation is older than the device-bound valid generation MUST fail closed.
 
-The anti-rollback marker must not live only inside the same snapshot-able directory it is intended to defeat. If the platform cannot provide a trustworthy monotonic/device-bound state source, document that rollback resistance is unavailable rather than pretending a local counter solves it.
+The anti-rollback marker MUST NOT live solely inside the same snapshot-able directory it protects.
 
 ## 6. No plaintext persistence
 
-Snapshot resistance is impossible if plaintext was written before the snapshot was taken.
+Secure MUST continue enforcing:
 
-Secure must continue enforcing:
-
-- SQLCipher for the Secure vault;
+- SQLCipher for Secure vault state;
 - encrypted SimpleX protocol databases;
-- independent encrypted attachment objects;
-- no plaintext drafts/history/contact secrets outside encrypted stores;
-- no plaintext thumbnails or previews persisted by default;
-- transactional attachment export, with temporary plaintext never becoming a durable application-cache artifact;
-- no secrets in argv, environment variables, logs, crash reports, WebView state, or analytics;
-- key material in zeroizing/locked memory where practical and destroyed on lock/burn.
+- independently encrypted attachment objects;
+- no plaintext drafts/history/contact/session secrets outside encrypted stores;
+- no persistent plaintext thumbnails/previews by default;
+- transactional attachment export;
+- no long-term secret in argv, environment variables, logs, crash reports, WebView state, or analytics;
+- zeroizing/locked secret memory where practical;
+- destruction of runtime key material on lock and Burn.
 
-## 7. Backup-safe update and migration behavior
+If plaintext was persistently written before a snapshot, later key destruction cannot make that plaintext encrypted retroactively. Therefore plaintext-at-rest regressions are release blockers.
 
-Migrations and upgrades frequently create backup copies, which would defeat the entire policy with impressive efficiency.
+## 7. Migration/update copies remain under the destruction hierarchy
 
-Every migration path must be audited for:
+Every migration/update path MUST audit and control:
 
-- `.bak` or old-database copies;
-- SQLite/SQLCipher journals, WAL/SHM files, migration sidecars, and temporary databases;
+- `.bak`/old-database copies;
+- SQLite/SQLCipher journals and sidecars;
 - SimpleX migration backups;
-- installer/updater rollback copies containing application data;
-- crash recovery files;
-- attachment conversion temporary files.
+- installer/updater rollback copies containing user data;
+- crash-recovery files;
+- temporary attachment conversions.
 
-If a migration backup is required, it must remain encrypted under the same destruction hierarchy and be removed best-effort after successful migration. A migration must never create a plaintext safety copy.
+Any required migration backup MUST stay encrypted under key material revoked by Burn and MUST be removed after successful migration. A plaintext safety copy is forbidden.
 
-## 8. Burn Identity ordering
+## 8. Burn ordering includes rollback revocation
 
-The burn sequence must treat snapshot-resistance keys as first-class destruction targets.
-
-Target sequence:
+Required sequence:
 
 ```text
-1. durably arm Burn Identity
-2. seal UI and block all new sensitive operations
+1. durably arm Burn / Self-Destruct
+2. seal UI and block new sensitive operations
 3. terminate SimpleX/controller and active messaging streams
-4. terminate Secure-owned Tor/SOCKS paths
+4. terminate Secure-owned SOCKS/Tor messaging paths
 5. revoke runtime attachment/session/database subkeys
-6. destroy/invalidate device-bound destruction secret and anti-rollback generation
-7. destroy current VMK wrapping/envelope access
-8. close encrypted stores
-9. best-effort remove encrypted databases, sidecars, attachments and caches
-10. reach terminal Destroyed state
+6. permanently invalidate the old device-bound identity generation/destruction secret
+7. destroy old messaging database key access
+8. destroy old VMK / vault-envelope access
+9. close encrypted stores
+10. best-effort remove old encrypted databases, sidecars, attachments and caches
+11. complete/clear old burn journal
+12. generate a fresh device-bound identity generation
+13. generate fresh VMK and protocol identity
+14. return as the automatic clean replacement identity
 ```
 
-The exact ordering between steps 6 and 7 must be chosen so a crash at either boundary can only resume forward and can never make an old snapshot valid again.
+The crash-recovery design MUST guarantee that once step 1 is durable, restart only moves forward. Once step 6 completes, no pre-burn application-data copy may become valid again.
 
-No cleanup failure after the cryptographic boundary may restore key access.
+## 9. Automatic replacement identity is part of the rollback model
 
-## 9. Burn Conversation
+Burn MUST automatically create a fresh unrelated identity after old destruction completes.
 
-Where protocol semantics permit, per-conversation destruction should follow the same philosophy:
+The replacement MUST have a newer valid device-bound generation. Restoring old files MUST NOT roll the replacement identity back to the destroyed generation.
 
-- freeze the relationship;
-- destroy conversation/session-specific local secret material where available;
-- destroy attachment keys;
-- remove encrypted records;
-- request cooperative remote deletion only as an optional best-effort action;
-- never claim the recipient's copy can be forcibly erased.
-
-If the messaging substrate does not expose a separately destroyable conversation key hierarchy, document that limitation rather than inventing one above the protocol.
+Replacement is not optional in the canonical Self-Destruct flow.
 
 ---
 
-# Verification requirements
+# Mandatory verification
 
-## Backup exclusion tests
+## Backup exclusion test
 
-On Windows and Linux release candidates:
+For each supported release platform:
 
-- run the normal supported OS/desktop backup path against a test profile and confirm Secure's sensitive data directory is excluded wherever the platform supports exclusion;
-- verify a generic privileged file copy can still copy ciphertext, proving the design does not depend on magical file invisibility;
-- document the exact observed behavior.
+1. create a populated Secure test identity;
+2. run the normal supported desktop/OS backup path;
+3. confirm Secure sensitive application state is excluded by the configured platform mechanism;
+4. separately prove a privileged file copy can still copy encrypted bytes;
+5. confirm the cryptographic rollback test below still succeeds when those bytes are restored.
 
-## Pre-burn snapshot recovery test
+## Pre-burn rollback test
 
-This is the critical test.
+This is a release-blocking test.
 
-1. Create an identity and seed known messages/attachments.
+1. Create identity A and seed known messages/attachments.
 2. Lock Secure.
-3. Copy the entire application-controlled data directory as a simulated pre-burn snapshot.
-4. Burn Identity completely.
-5. Restore the copied directory.
-6. Attempt unlock with the original correct passphrase.
-7. Assert recovery fails because required device-bound destruction/epoch state no longer exists or is invalid.
-8. Verify no supported Secure code path can recreate the destroyed key material from the restored files.
+3. Copy the entire application-controlled data directory.
+4. Burn A completely.
+5. Allow Secure to automatically create fresh identity B.
+6. Restore A's copied application-data directory.
+7. Launch Secure.
+8. Enter A's original correct passphrase.
+9. Assert A cannot be recovered.
+10. Assert Secure cannot roll device-bound generation B back to A.
+11. Assert no supported code path can recreate A's destroyed device-bound/VMK/protocol secrets from the restored files.
 
-Run the same test with a replacement identity created after burn and confirm restoring the old snapshot cannot roll the replacement identity backward.
+The same test MUST run after each material key-hierarchy, storage, installer, migration, or platform-security change.
 
-## Live-memory boundary test
+## Crash/fault test
 
-Document separately that a snapshot containing live RAM or hardware/vTPM secret state is outside the disk-only guarantee. Do not let a passing disk-snapshot test become a broader claim than it proves.
+Crash or inject failure at every Burn boundary, especially immediately before/after device-bound generation invalidation and VMK destruction.
 
-## Migration test
+After durable Burn intent, no restart state may restore the old identity.
 
-Plant unique plaintext markers in test messages/attachment metadata, perform every supported database/application migration, and search all application-controlled files for those markers. None may appear outside encrypted stores.
+## Migration plaintext test
+
+Plant unique known plaintext markers, perform every supported migration/update, then inspect all application-controlled files. The markers MUST NOT appear outside deliberately encrypted stores.
 
 ---
 
-# Release tiers
+# Release gate
 
-Secure should report the achieved local protection tier rather than pretending every machine provides identical guarantees.
+Secure is production-eligible on a platform only when that platform passes all of the following:
 
-### Tier A - hardware-backed snapshot resistance
+- device-bound non-exportable destruction/rollback primitive is available and used;
+- identity generation cannot be rolled backward using only restored application data;
+- ordinary backup/sync exclusion is configured and tested;
+- pre-burn application-state restoration cannot recover a burned identity with the old correct passphrase;
+- automatic fresh identity creation after Burn passes crash/fault tests;
+- no plaintext persistence is detected;
+- all relevant storage/migration copies remain under the destroyed key hierarchy.
 
-- device-bound non-exportable destruction secret available;
-- anti-rollback/epoch mechanism available;
-- ordinary backups excluded where supported;
-- old disk/file snapshots fail after burn even with the correct former passphrase;
-- no plaintext persistence detected by release tests.
-
-### Tier B - software-only cryptographic erasure
-
-- encrypted stores and VMK destruction remain active;
-- ordinary backups excluded where supported;
-- no plaintext persistence detected;
-- an old snapshot containing the wrapped VMK may remain recoverable if an attacker later obtains all wrapping material, so the UI/docs must not claim Tier A snapshot resistance.
+Failure of any item blocks the supported production security mode. There is no weaker production tier presented as equivalent.
 
 ---
 
 # Product wording
 
-Permitted wording after the relevant release tests pass:
+After the required release tests pass, Secure may state narrowly:
 
-> Secure minimizes participation in ordinary backup and sync systems and uses cryptographic key destruction so residual encrypted application data is not relied on being physically erased. On supported hardware, destroyed identities additionally depend on device-bound key material so restoring an old application-data snapshot does not restore access to the destroyed identity.
+> Burn permanently revokes the local cryptographic identity and automatically creates a fresh unrelated identity. Restoring an old copy of Secure's application-controlled data does not restore a burned identity on supported Secure production platforms, because the old state also depends on device-bound anti-rollback key material invalidated by Burn.
 
-Do not use:
-
-- "cannot be snapshotted";
-- "cannot be backed up";
-- "leaves no trace";
-- "forensically unrecoverable under all circumstances";
-- "guaranteed impossible to recover".
-
-Those claims exceed what an application can prove on a general-purpose Windows or Linux host.
+Secure MUST NOT claim that privileged software is physically incapable of copying bytes, that live RAM compromise is impossible, or that another participant's independent copy can be forcibly erased.
