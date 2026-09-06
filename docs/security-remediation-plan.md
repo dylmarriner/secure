@@ -55,11 +55,18 @@ The following findings remain active and are ordered below by remediation depend
 
 ## Work
 
-- [ ] Add a prominent link from the implementation plan and README to this remediation plan.
-- [ ] Mark host-level messaging wiring as blocked until Phases R1-R4 are complete.
-- [ ] Reconcile stale architecture text that still describes the SimpleX licensing choice as unresolved.
-- [ ] Keep the README's pre-release warning until Phase R9 is complete.
-- [ ] Add a machine-readable CI marker/job name for the remediation gate so branch rules can require it later.
+- [x] Add a prominent link from the implementation plan and README to this remediation plan.
+      (README already linked it; added the same link plus a blocked-wiring note to
+      `docs/implementation-plan.md`.)
+- [x] Mark host-level messaging wiring as blocked until Phases R1-R4 are complete
+      (`docs/implementation-plan.md`, top-of-file note and Phase 6 burn-sequence step 2).
+- [x] Reconcile stale architecture text that still describes the SimpleX licensing choice as
+      unresolved. Checked `docs/security-architecture.md` and `docs/implementation-plan.md`
+      Phase 3: both already state the licensing gate is resolved (AGPLv3-compatible); no stale
+      text found.
+- [x] Keep the README's pre-release warning until Phase R9 is complete (still present, unchanged).
+- [x] Add a machine-readable CI marker/job name for the remediation gate so branch rules can
+      require it later (`remediation-gate` job in `.github/workflows/ci.yml`).
 
 ## Exit criteria
 
@@ -88,18 +95,18 @@ The vault-envelope helper `write_file_atomically` also guarantees atomic replace
 
 ## Work
 
-- [ ] Move the initial journal arm ahead of the irreversible lifecycle transition/destructive work. If the durable `Armed` record cannot be persisted, return an error and leave the identity intact.
-- [ ] Stop discarding per-stage journal-write errors. After a destruction step succeeds, failure to persist the new stage must abort the live sequence while preserving the older journal stage so restart safely re-runs the idempotent step.
-- [ ] Keep journal clearing best-effort only after `Complete`; a stale completed journal is harmless because restart replays cleanup.
-- [ ] Replace `write_file_atomically` for persistent key-envelope creation with a durable atomic write: write sibling temp file, `sync_all`, rename, fsync parent directory on Unix, and use the strongest practical Windows equivalent already documented by the project.
-- [ ] Ensure a failed replacement-identity provisioning cannot erase or overwrite evidence needed to resume an incomplete burn.
+- [x] Move the initial journal arm ahead of the irreversible lifecycle transition/destructive work. If the durable `Armed` record cannot be persisted, return an error and leave the identity intact. (`destroy_identity_locked` now propagates the arm write's `Result` and returns before any `perform_destruction_step` runs.)
+- [x] Stop discarding per-stage journal-write errors. After a destruction step succeeds, failure to persist the new stage must abort the live sequence while preserving the older journal stage so restart safely re-runs the idempotent step. (Same function: the per-stage `record_stage` call now propagates its error via `?` instead of `let _ =`.)
+- [x] Keep journal clearing best-effort only after `Complete`; a stale completed journal is harmless because restart replays cleanup. (Unchanged - already correct.)
+- [x] Replace `write_file_atomically` for persistent key-envelope creation with a durable atomic write: write sibling temp file, `sync_all`, rename, fsync parent directory on Unix, and use the strongest practical Windows equivalent already documented by the project. (`write_file_atomically` now mirrors `destruction_journal::write_durably`: `File::create` + `sync_all` on the temp file, rename, then `destruction_journal::sync_parent_dir`. Covers both the vault key envelope and the failed-unlock-attempts counter, its only two callers.)
+- [x] Ensure a failed replacement-identity provisioning cannot erase or overwrite evidence needed to resume an incomplete burn. (Already true by construction: `burn_identity_impl` only calls `provision_new_vault` after `destroy_identity_locked` returns `Ok` with the journal cleared and the lifecycle at `Destroyed` - there is no "incomplete burn" evidence left to protect by that point.)
 
 ## Required regression tests
 
-- [ ] `burn_refuses_to_start_when_journal_cannot_be_armed`: make the journal path unwritable/invalid, request Burn Identity, assert the envelope and database still exist and the application does not enter an irreversible destruction state.
-- [ ] `failed_stage_journal_write_is_replayed_after_restart`: inject a write failure after one idempotent stage, reconstruct runtime, and assert restart resumes from the earlier durable stage and still reaches `Destroyed`.
-- [ ] `durable_envelope_write_round_trips_after_simulated_restart`: provision, close all handles, construct a fresh runtime, and unlock successfully.
-- [ ] Existing corrupt-journal and monotonic-stage tests remain green.
+- [x] `burn_refuses_to_start_when_journal_cannot_be_armed`: pre-occupies the journal's `write_durably` temp-file path with a directory so the arm write fails, requests Burn Identity, and asserts the envelope and database still exist, the journal was never created, and the untouched vault still unlocks with the original passphrase.
+- [x] `failed_stage_journal_write_is_replayed_after_restart`: arms normally, then occupies the temp-file path so only the first per-stage write fails; asserts `destroy_identity_locked` returns an error, the journal still names the earlier stage, and a fresh runtime with the fault cleared resumes forward to `Destroyed`.
+- [x] `durable_envelope_write_round_trips_after_simulated_restart`: provisions, drops the runtime, constructs a fresh one, and unlocks successfully.
+- [x] Existing corrupt-journal and monotonic-stage tests remain green (verified via `cargo test --workspace --all-targets`).
 
 ## Verification
 
