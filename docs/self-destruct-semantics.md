@@ -46,7 +46,7 @@ destroy old VMK / vault-envelope access
 OLD IDENTITY IS CRYPTOGRAPHICALLY DEAD
       |
       v
-best-effort cleanup of old encrypted state
+mandatory best-effort cleanup of old encrypted state
       |
       v
 complete and clear old burn journal
@@ -159,11 +159,11 @@ If fresh-identity provisioning fails because of randomness, storage, hardware-ke
 - restart resumes from a fresh-identity state;
 - Secure never falls back to the old identity.
 
-### 10. Cleanup is secondary to key destruction
+### 10. Cleanup is mandatory defence in depth
 
-Secure SHOULD best-effort remove old encrypted databases, attachments, caches, sidecars, migration files, and bookkeeping after the relevant cryptographic keys have been destroyed.
+After destroying the relevant cryptographic keys, Secure MUST make a best-effort cleanup attempt over all old application-controlled encrypted state, including databases, attachments, caches, sidecars, migration files, protocol stores and destruction bookkeeping that no longer needs to persist.
 
-Physical deletion is defence in depth. The security boundary is destruction or invalidation of the key hierarchy required to interpret residual encrypted bytes.
+A cleanup failure MUST NOT restore key access or make Burn reversible. Physical deletion is defence in depth; the security boundary remains destruction or invalidation of the key hierarchy required to interpret residual encrypted bytes.
 
 ### 11. Recipient copies are outside the local guarantee
 
@@ -207,6 +207,7 @@ Release tests MUST include:
 - crash/restart at every Burn stage never restores the old identity after durable burn intent;
 - crash after destruction but before replacement leaves the old identity destroyed and resumes only fresh provisioning;
 - restoring a pre-burn application-data copy after replacement cannot recover or roll back to the old identity;
+- mandatory best-effort cleanup is attempted over every registered old application-controlled persistence location;
 - no supported production code path can recreate destroyed device-bound, VMK, messaging-database, attachment, or protocol secrets from residual application files.
 
 ## Relationship to other documents
