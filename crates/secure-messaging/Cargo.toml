@@ -8,12 +8,21 @@ publish = false
 
 [dependencies]
 futures-util = "0.3"
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror.workspace = true
 tokio = { version = "1", features = ["process", "rt", "sync", "io-util", "macros", "time"] }
 tokio-tungstenite = "0.30"
 zeroize.workspace = true
+
+[features]
+# Links `crates/secure-messaging/src/simplex/core.rs` against upstream simplex-chat's native
+# core, built from source by `scripts/build-simplex-native.sh`. Off by default: the artifact is
+# not vendored in this repository (233MB, a GHC-runtime shared-library tree, not something to
+# commit to git - see that script's own docs), so CI and ordinary `cargo build`/`cargo test` runs
+# do not require it. See `build.rs` and `docs/security-remediation-plan.md` Phase R3.
+simplex-native = []
 
 [dev-dependencies]
 tempfile = "3"

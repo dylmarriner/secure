@@ -18,11 +18,13 @@
 //! integration-test/dev-only adapter, not the production secret-delivery boundary, because it
 //! necessarily places the database encryption key in this process's argv (`client.rs` module
 //! docs explain why there is no better flag). Production requires linking upstream's native core
-//! and its in-memory key API instead - blocked on an upstream native library artifact this
-//! repository does not currently vendor or have network access to build.
+//! and its in-memory key API instead - see [`core`] (behind the `simplex-native` feature), which
+//! does exactly that, built from source by `scripts/build-simplex-native.sh`.
 
 pub(crate) mod adapter;
 pub(crate) mod client;
 pub(crate) mod commands;
+#[cfg(feature = "simplex-native")]
+pub(crate) mod core;
 pub(crate) mod events;
 pub(crate) mod protocol;

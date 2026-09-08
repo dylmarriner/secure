@@ -50,12 +50,11 @@
 //! way to take that key - see the `-k`/`--key` note above - so this module's [`SimplexClient`]
 //! is explicitly retained as an integration-test/dev-only adapter, kept because it is a real,
 //! working, independently useful compatibility harness against the actual upstream binary, not
-//! because it is an acceptable production boundary. The production path requires linking
-//! upstream's native core and calling its in-memory key API (`chatMigrateInit`/
-//! `chat_migrate_init`) instead of spawning this CLI; that needs the actual upstream native
-//! library artifact (build/FFI headers, a packaged `.so`/`.dll`) which is not vendored in or
-//! reachable from this repository/environment, so it is not implemented here rather than being
-//! faked with an unlinkable stub. Do not wire this module into a production launch path.
+//! because it is an acceptable production boundary. The production path is
+//! [`super::core::SimplexCore`] (behind the `simplex-native` cargo feature), which links
+//! upstream's native core and calls its in-memory key API (`chat_migrate_init_key`) instead of
+//! spawning this CLI - see that module for the build recipe and what has been verified against
+//! the real library. Do not wire this module into a production launch path.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
