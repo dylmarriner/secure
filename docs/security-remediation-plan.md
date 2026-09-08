@@ -365,22 +365,50 @@ The production SimpleX store is encrypted with a VMK-derived, domain-separated k
 
 ## Work
 
-- [ ] Configure the SimpleX core network settings to the Secure-owned loopback SOCKS address using upstream `APISetNetworkConfig` (`/_network <json(networkConfig)>`) or the equivalent native API before allowing any user messaging operation.
-- [ ] Read the network configuration back (`APIGetNetworkConfig` / `/network`) and fail startup if the effective proxy does not match the Secure-owned SOCKS listener.
-- [ ] Refuse messaging startup unless Tor is `Ready` and the SOCKS bridge is active.
-- [ ] Stop/fail messaging immediately if the bridge dies or transport leaves `Ready`.
-- [ ] Add circuit isolation at the narrowest practical relationship boundary supported by the Arti/SOCKS/SimpleX combination; document exactly what is and is not isolated.
-- [ ] Run a two-fresh-client test: bootstrap both over Tor, create invitation, accept, send message, receive message, verify delivery status.
-- [ ] Run the same flow with the SOCKS bridge intentionally killed and prove there is no successful direct fallback.
-- [ ] Add packet/DNS observation in a dedicated Linux integration environment to prove messaging destinations are not resolved or contacted directly by Secure/SimpleX outside the Tor path.
+- [x] Configure the SimpleX core network settings to the Secure-owned loopback SOCKS address using upstream `APISetNetworkConfig` (`/_network <json(networkConfig)>`) or the equivalent native API before allowing any user messaging operation.
+      `simplex::commands::set_network_config` builds the exact `/_network <json>` payload,
+      transcribed field-for-field from `simplexmq` commit `efaad8e73436d60f5052f07dda6b71151ad5039b`
+      (the commit `simplex-chat`'s own `cabal.project` pins), not guessed - see that function's
+      module-level doc comment for the full provenance trail. `SimplexAdapter::configure_network`
+      sends it.
+- [x] Read the network configuration back (`APIGetNetworkConfig` / `/network`) and fail startup if the effective proxy does not match the Secure-owned SOCKS listener.
+      `SimplexAdapter::configure_network` always follows the set with `get_network_config` and
+      returns `AdapterError::NetworkConfigMismatch` (fail closed) unless the read-back
+      `socksProxy` matches exactly.
+- [ ] Refuse messaging startup unless Tor is `Ready` and the SOCKS bridge is active. Not yet
+      actionable: this is a runtime-composition decision (which stage order to enforce across
+      transport + messaging), and no runtime owns both yet - that runtime is Phase R5's job. What
+      this phase could do without that runtime - the command/verification primitives
+      `configure_network` needs - is done; R5 is where a caller actually holds a `TorSocksProxy`
+      address and a `SimplexAdapter` at the same time to call it from.
+- [ ] Stop/fail messaging immediately if the bridge dies or transport leaves `Ready`. Same
+      blocker as above - deferred to R5's runtime, which is what will own both lifecycles to
+      react to one from the other.
+- [x] Add circuit isolation at the narrowest practical relationship boundary supported by the Arti/SOCKS/SimpleX combination; document exactly what is and is not isolated.
+      `secure_transport::socks::ConnectionIsolation` keys each proxied connection's
+      `arti_client::StreamPrefs` isolation off the SOCKS5 username/password the connecting client
+      presented (verified against `tor-socksproto` 0.46's real `SocksAuth`/server handshake
+      support and `arti_client`'s real `StreamPrefs`/`IsolationHelper` API, not guessed) - same
+      credentials may share a circuit, different credentials never do. This is exactly what
+      upstream SimpleX's own default `SocksIsolateByAuth` behavior needs: `set_network_config`
+      deliberately sends no SOCKS auth prefix, which upstream parses as "generate a fresh
+      per-connection username/password yourself", so a normal SimpleX connection now gets a
+      fresh circuit through this bridge automatically. Scope explicitly documented on
+      `TorSocksProxy`: isolation is decided once per SOCKS *connection* (not per multiplexed
+      request within one), the direct (non-SOCKS) `TorTransport::connect` path is untouched by
+      this, and any two callers presenting identical credentials (e.g. two `SocksAuth::NoAuth`
+      connections) still share one isolation group with each other.
+- [ ] Run a two-fresh-client test: bootstrap both over Tor, create invitation, accept, send message, receive message, verify delivery status. Blocked on infrastructure this environment does not have: the `simplex-native` GHC/cabal build toolchain is not installed here (see `core.rs`/`scripts/build-simplex-native.sh`), so there is no `libsimplex.so` to run two cores against each other with.
+- [ ] Run the same flow with the SOCKS bridge intentionally killed and prove there is no successful direct fallback. Same blocker as above.
+- [ ] Add packet/DNS observation in a dedicated Linux integration environment to prove messaging destinations are not resolved or contacted directly by Secure/SimpleX outside the Tor path. Explicitly scoped to a dedicated integration environment by this phase's own text, not this session's.
 
 ## Required tests
 
-- [ ] two clients establish contact through one-time invitation over Secure's Tor path.
-- [ ] message round-trip succeeds through Tor.
-- [ ] killing SOCKS prevents delivery and does not produce direct relay connections.
-- [ ] unsupported raw-IP SOCKS target remains rejected.
-- [ ] restart with persisted encrypted SimpleX state restores the relationship without plaintext migration.
+- [ ] two clients establish contact through one-time invitation over Secure's Tor path. Blocked on the live `simplex-native` build - see above.
+- [ ] message round-trip succeeds through Tor. Same blocker.
+- [ ] killing SOCKS prevents delivery and does not produce direct relay connections. Same blocker.
+- [ ] unsupported raw-IP SOCKS target remains rejected. Same blocker (needs a live core to exercise `APISetNetworkConfig` end-to-end, not just the command-string/JSON-shape unit tests this session added).
+- [ ] restart with persisted encrypted SimpleX state restores the relationship without plaintext migration. Same blocker.
 
 ## Exit criteria
 

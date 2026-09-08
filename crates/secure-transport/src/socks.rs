@@ -1,14 +1,15 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
-use arti_client::TorClient;
+use arti_client::isolation::IsolationHelper;
+use arti_client::{StreamPrefs, TorClient};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tor_rtcompat::PreferredRuntime;
 use tor_socksproto::{
-    Buffer, Handshake, NextStep, PreciseReads, SocksAddr, SocksCmd, SocksProxyHandshake,
+    Buffer, Handshake, NextStep, PreciseReads, SocksAddr, SocksAuth, SocksCmd, SocksProxyHandshake,
     SocksStatus,
 };
 
@@ -24,6 +25,20 @@ use crate::{TransportError, ready_client};
 /// closes both sides of the proxied connection as soon as the in-flight copy notices the
 /// signal, without waiting for the remote peer. The bound address is safe to pass to a local
 /// subprocess; the listener never binds a non-loopback interface.
+///
+/// # Circuit isolation (`docs/security-remediation-plan.md` Phase R4)
+///
+/// Each proxied connection is isolated from every other by the SOCKS5 username/password the
+/// connecting client presented in its handshake: same credentials may share a circuit, different
+/// credentials (or no credentials vs. any credentials) never do - see [`ConnectionIsolation`].
+/// This is per-*SOCKS-connection* isolation only. It does **not** isolate: different requests
+/// multiplexed over one already-open SOCKS connection (isolation is decided once, at `connect`
+/// time, from that connection's handshake); anything about `TorTransport::connect`'s direct
+/// (non-SOCKS) path, which does not go through this module and currently uses the transport's
+/// shared default isolation; or two connections that happen to present the same credentials
+/// (e.g. two callers that both connect with `SocksAuth::NoAuth` share one isolation group with
+/// each other). Whether a given caller (e.g. SimpleX) actually presents distinct per-connection
+/// credentials is that caller's choice, not something this bridge can enforce from its side.
 pub struct TorSocksProxy {
     address: SocketAddr,
     task: JoinHandle<()>,
@@ -133,6 +148,29 @@ async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
     }
 }
 
+/// Isolates proxied streams by the SOCKS5 username/password the connecting client presented,
+/// matching upstream SimpleX's own `SocksIsolateByAuth` expectation (see
+/// `docs/security-remediation-plan.md` Phase R4): two streams that authenticated with the same
+/// credentials may share a circuit, two that authenticated differently (or one that sent no
+/// auth at all vs one that did) never will. `tor-socksproto`'s server-side handshake already
+/// accepts a USERNAME/PASSWORD SOCKS5 auth method from the client, so a caller like SimpleX that
+/// generates a fresh random username/password per connection gets a fresh circuit per
+/// connection "for free" - this type is what turns that already-accepted auth into an actual
+/// `arti_client::StreamPrefs` isolation instead of silently discarding it and pooling every
+/// proxied stream onto the transport's shared default isolation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConnectionIsolation(SocksAuth);
+
+impl IsolationHelper for ConnectionIsolation {
+    fn compatible_same_type(&self, other: &Self) -> bool {
+        self == other
+    }
+
+    fn join_same_type(&self, other: &Self) -> Option<Self> {
+        (self == other).then(|| self.clone())
+    }
+}
+
 async fn serve(
     mut socket: TcpStream,
     lifecycle: &Mutex<TransportLifecycle>,
@@ -166,8 +204,11 @@ async fn serve(
         }
     };
 
+    let mut prefs = StreamPrefs::new();
+    prefs.set_isolation(ConnectionIsolation(request.auth().clone()));
+
     let mut stream = match tor_client
-        .connect((hostname.as_ref().to_owned(), request.port()))
+        .connect_with_prefs((hostname.as_ref().to_owned(), request.port()), &prefs)
         .await
     {
         Ok(stream) => stream,
@@ -215,5 +256,33 @@ async fn read_request(
             }
             NextStep::Finished(request) => return request.into_output().map_err(Into::into),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arti_client::isolation::Isolation;
+
+    use super::*;
+
+    #[test]
+    fn same_socks_auth_is_compatible_isolation() {
+        let a = ConnectionIsolation(SocksAuth::Username(b"tok".to_vec(), b"tok".to_vec()));
+        let b = ConnectionIsolation(SocksAuth::Username(b"tok".to_vec(), b"tok".to_vec()));
+        assert!(Isolation::compatible(&a, &b));
+    }
+
+    #[test]
+    fn distinct_socks_auth_is_incompatible_isolation() {
+        let a = ConnectionIsolation(SocksAuth::Username(b"one".to_vec(), b"one".to_vec()));
+        let b = ConnectionIsolation(SocksAuth::Username(b"two".to_vec(), b"two".to_vec()));
+        assert!(!Isolation::compatible(&a, &b));
+    }
+
+    #[test]
+    fn no_auth_is_incompatible_with_any_authenticated_connection() {
+        let unauthenticated = ConnectionIsolation(SocksAuth::NoAuth);
+        let authenticated = ConnectionIsolation(SocksAuth::Username(b"x".to_vec(), b"x".to_vec()));
+        assert!(!Isolation::compatible(&unauthenticated, &authenticated));
     }
 }

@@ -12,6 +12,8 @@
 //! generally treats a missing key as `Nothing`, and omitting is the more conservative choice
 //! for a client we cannot run against here to verify either encoding works.
 
+use std::net::SocketAddrV4;
+
 use serde::Serialize;
 
 /// `/_start` - start the chat controller. No parameters are interpolated into the command
@@ -103,6 +105,160 @@ pub fn send_text_message(kind: ChatKind, chat_id: i64, text: &str) -> String {
     format!("/_send {} json {json}", chat_ref(kind, chat_id))
 }
 
+// # Network configuration (`docs/security-remediation-plan.md` Phase R4)
+//
+// Every field/tag name below is transcribed from `simplexmq` commit
+// `efaad8e73436d60f5052f07dda6b71151ad5039b` (the exact commit `simplex-chat`'s
+// `cabal.project` pins at `SIMPLEX_CHAT_COMMIT` in `scripts/build-simplex-native.sh`), not
+// guessed:
+// - `src/Simplex/Messaging/Client.hs`: `NetworkConfig`'s field names (`$(deriveJSON defaultJSON
+//   ''NetworkConfig)`, so JSON keys are the Haskell field names verbatim - `defaultJSON` only
+//   sets `omitNothingFields`, it does not rename anything), and the `HostMode`/`SocksMode`/
+//   `TransportSessionMode`/`SMPProxyMode`/`SMPProxyFallback`/`SMPWebPortServers` enum tag
+//   strings (`enumJSON $ dropPrefix "..."`: drop the constructor prefix, lowercase the first
+//   remaining letter - e.g. `HMPublic` -> `public`, `SPFAllowProtected` -> `allowProtected`).
+// - `src/Simplex/Messaging/Transport/KeepAlive.hs`: `KeepAliveOpts` fields/defaults.
+// - `src/Simplex/Messaging/Transport/Client.hs`: `SocksProxyWithAuth`/`SocksAuth`'s
+//   `StrEncoding` (`socksProxy` is a plain JSON string, not an object: `<authPrefix><host>:
+//   <port>`). This module always sends an address with no auth prefix at all, which upstream's
+//   own `strP` parses as `SocksIsolateByAuth` (its own default, and its own fallback when
+//   neither `user:pass@` nor a bare `@` matched) - that is what makes upstream generate a fresh
+//   per-connection SOCKS5 username/password itself, which is exactly the signal
+//   `secure_transport::socks::TorSocksProxy`'s per-connection circuit isolation (also Phase R4)
+//   keys off. Do not add an explicit `@`/`user:pass@` prefix here without re-deriving both sides
+//   of that isolation contract together.
+// - `apps/ios/Shared/Model/AppAPITypes.swift` confirms the `/_network`/`/network` command-string
+//   wrapping (`ChatCommand.apiSetNetworkConfig`/`apiGetNetworkConfig`'s `cmdString`) and, via
+//   `apps/ios/SimpleXChat/APITypes.swift`'s `NetCfg.defaults`, the numeric/enum default values
+//   below - the same defaults every official client sends unless a user has changed advanced
+//   settings, so this is what a from-scratch Secure profile should send too.
+//
+// None of this has been run against a live `simplex-chat` process from this crate yet (that
+// needs the native library this environment cannot build - see `core.rs`'s module docs); it is
+// checked against upstream's actual source at the pinned commit, matching this module's own
+// documented policy of not guessing command syntax, but is not yet the "live two-client Tor"
+// empirical proof Phase R4's exit criteria requires.
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct NetworkTimeout {
+    #[serde(rename = "backgroundTimeout")]
+    background_timeout: u64,
+    #[serde(rename = "interactiveTimeout")]
+    interactive_timeout: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct KeepAliveOpts {
+    #[serde(rename = "keepIdle")]
+    keep_idle: u32,
+    #[serde(rename = "keepIntvl")]
+    keep_intvl: u32,
+    #[serde(rename = "keepCnt")]
+    keep_cnt: u32,
+}
+
+/// `NetworkConfig` - the JSON payload of `/_network <json>` (`APISetNetworkConfig`). All fields
+/// except `socksProxy`/`tcpKeepAlive` are non-`Maybe` upstream, so every one of them must be
+/// present (see this section's doc comment above); values other than `socks_proxy` are fixed at
+/// upstream's own documented defaults - there is no Secure-specific reason to diverge from them.
+#[derive(Debug, Serialize)]
+struct NetworkConfig {
+    #[serde(rename = "socksProxy")]
+    socks_proxy: String,
+    #[serde(rename = "socksMode")]
+    socks_mode: &'static str,
+    #[serde(rename = "hostMode")]
+    host_mode: &'static str,
+    #[serde(rename = "requiredHostMode")]
+    required_host_mode: bool,
+    #[serde(rename = "sessionMode")]
+    session_mode: &'static str,
+    #[serde(rename = "smpProxyMode")]
+    smp_proxy_mode: &'static str,
+    #[serde(rename = "smpProxyFallback")]
+    smp_proxy_fallback: &'static str,
+    #[serde(rename = "smpWebPortServers")]
+    smp_web_port_servers: &'static str,
+    #[serde(rename = "tcpConnectTimeout")]
+    tcp_connect_timeout: NetworkTimeout,
+    #[serde(rename = "tcpTimeout")]
+    tcp_timeout: NetworkTimeout,
+    #[serde(rename = "tcpTimeoutPerKb")]
+    tcp_timeout_per_kb: u64,
+    #[serde(rename = "rcvConcurrency")]
+    rcv_concurrency: u32,
+    #[serde(rename = "tcpKeepAlive")]
+    tcp_keep_alive: KeepAliveOpts,
+    #[serde(rename = "smpPingInterval")]
+    smp_ping_interval: u64,
+    #[serde(rename = "smpPingCount")]
+    smp_ping_count: u32,
+    #[serde(rename = "logTLSErrors")]
+    log_tls_errors: bool,
+}
+
+/// The `socksProxy` string form of `socks_address`, with no `SocksAuth` prefix - see this
+/// section's module-level doc comment for why that specific absence matters. Shared with
+/// [`super::adapter::SimplexAdapter::configure_network`], which must compare the exact same
+/// string back against what `get_network_config`'s response reports, rather than each side
+/// independently reformatting the address and risking silent drift between them.
+pub(crate) fn socks_proxy_string(socks_address: SocketAddrV4) -> String {
+    format!("{}:{}", socks_address.ip(), socks_address.port())
+}
+
+impl NetworkConfig {
+    fn for_socks_proxy(socks_address: SocketAddrV4) -> Self {
+        Self {
+            socks_proxy: socks_proxy_string(socks_address),
+            socks_mode: "always",
+            host_mode: "public",
+            required_host_mode: true,
+            session_mode: "user",
+            smp_proxy_mode: "always",
+            smp_proxy_fallback: "allowProtected",
+            smp_web_port_servers: "preset",
+            tcp_connect_timeout: NetworkTimeout {
+                background_timeout: 45_000_000,
+                interactive_timeout: 15_000_000,
+            },
+            tcp_timeout: NetworkTimeout {
+                background_timeout: 30_000_000,
+                interactive_timeout: 10_000_000,
+            },
+            tcp_timeout_per_kb: 10_000,
+            rcv_concurrency: 12,
+            tcp_keep_alive: KeepAliveOpts {
+                keep_idle: 30,
+                keep_intvl: 15,
+                keep_cnt: 4,
+            },
+            smp_ping_interval: 1_200_000_000,
+            smp_ping_count: 3,
+            log_tls_errors: false,
+        }
+    }
+}
+
+/// `/_network <json(networkConfig)>` - `APISetNetworkConfig`: route every future SMP/network
+/// operation through Secure's own loopback SOCKS bridge (`secure_transport::TorSocksProxy`),
+/// with no direct-connection fallback path in the config itself. Must be sent and its read-back
+/// (`get_network_config`) verified before any messaging operation that could touch the network -
+/// wiring that check into a runtime that owns both the SimpleX core and the transport is Phase
+/// R5's job (no such runtime exists to call this from yet).
+pub fn set_network_config(socks_address: SocketAddrV4) -> String {
+    let config = NetworkConfig::for_socks_proxy(socks_address);
+    // Every field above is a plain string/bool/int/nested-record - this cannot fail.
+    let json = serde_json::to_string(&config).expect("NetworkConfig always serialises");
+    format!("/_network {json}")
+}
+
+/// `/network` - `APIGetNetworkConfig`: read back the network config currently in effect, to
+/// verify it is still the loopback SOCKS bridge `set_network_config` requested (fail closed if
+/// it is not - see that function's doc comment).
+pub fn get_network_config() -> String {
+    "/network".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,5 +312,62 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(json_part).expect("payload must be valid JSON");
         assert_eq!(payload[0]["msgContent"]["text"], original_text);
+    }
+
+    #[test]
+    fn get_network_config_matches_documented_syntax() {
+        assert_eq!(get_network_config(), "/network");
+    }
+
+    #[test]
+    fn set_network_config_wraps_the_documented_prefix() {
+        let address: SocketAddrV4 = "127.0.0.1:9999".parse().expect("valid address");
+        let command = set_network_config(address);
+        assert!(command.starts_with("/_network "));
+    }
+
+    #[test]
+    fn set_network_config_socks_proxy_has_no_auth_prefix() {
+        // No `@`/`user:pass@` prefix at all, so upstream's own `SocksAuth` parser falls back to
+        // `SocksIsolateByAuth` - see this section's module-level doc comment for why that
+        // matters for `secure-transport`'s per-connection circuit isolation.
+        let address: SocketAddrV4 = "127.0.0.1:9999".parse().expect("valid address");
+        let command = set_network_config(address);
+        let json_part = command.strip_prefix("/_network ").expect("prefix");
+        let payload: serde_json::Value =
+            serde_json::from_str(json_part).expect("payload must be valid JSON");
+        assert_eq!(payload["socksProxy"], "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn set_network_config_sends_every_required_non_maybe_field() {
+        // `NetworkConfig`'s aeson instance is `deriveJSON defaultJSON` with no custom
+        // partial-parse fallback, so a from-scratch profile must send every field that is not
+        // `Maybe` upstream or the read-back configuration will fail to parse entirely.
+        let address: SocketAddrV4 = "127.0.0.1:9999".parse().expect("valid address");
+        let command = set_network_config(address);
+        let json_part = command.strip_prefix("/_network ").expect("prefix");
+        let payload: serde_json::Value =
+            serde_json::from_str(json_part).expect("payload must be valid JSON");
+        for field in [
+            "socksProxy",
+            "socksMode",
+            "hostMode",
+            "requiredHostMode",
+            "sessionMode",
+            "smpProxyMode",
+            "smpProxyFallback",
+            "smpWebPortServers",
+            "tcpConnectTimeout",
+            "tcpTimeout",
+            "tcpTimeoutPerKb",
+            "rcvConcurrency",
+            "tcpKeepAlive",
+            "smpPingInterval",
+            "smpPingCount",
+            "logTLSErrors",
+        ] {
+            assert!(!payload[field].is_null(), "missing required field {field}");
+        }
     }
 }

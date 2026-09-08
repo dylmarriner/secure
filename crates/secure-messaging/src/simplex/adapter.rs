@@ -10,7 +10,7 @@
 //! the right way to close that gap when there is a real caller for it - see
 //! `docs/implementation-plan.md` Phase 3.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -30,6 +30,14 @@ pub enum AdapterError {
     UnexpectedResponse(serde_json::Value),
     #[error("bootstrap must complete before this operation")]
     NotBootstrapped,
+    #[error(
+        "simplex-chat's effective SOCKS proxy ({actual:?}) does not match the Secure-owned \
+         loopback bridge ({expected}) - refusing to allow messaging over an unverified path"
+    )]
+    NetworkConfigMismatch {
+        expected: SocketAddrV4,
+        actual: Option<String>,
+    },
 }
 
 /// A one-time SimpleX invitation link, ready to hand to a contact out-of-band (QR code, copy,
@@ -87,6 +95,28 @@ impl SimplexAdapter {
             },
             events,
         ))
+    }
+
+    /// Point simplex-chat's network config at Secure's own loopback SOCKS bridge and read it
+    /// back to prove the change actually took effect, per
+    /// `docs/security-remediation-plan.md` Phase R4: `APISetNetworkConfig` succeeding is not by
+    /// itself proof the effective config matches what was requested, so this always follows up
+    /// with `APIGetNetworkConfig` and fails closed (returns
+    /// [`AdapterError::NetworkConfigMismatch`]) rather than assuming success. Callers must
+    /// refuse to allow any messaging operation - not just skip this call - if this errors: the
+    /// alternative is an unverified, potentially direct (non-Tor) network path.
+    pub async fn configure_network(&self, socks_address: SocketAddrV4) -> Result<(), AdapterError> {
+        self.run(commands::set_network_config(socks_address))
+            .await?;
+        let response = self.run(commands::get_network_config()).await?;
+        let actual = extract_socks_proxy(&response);
+        if actual.as_deref() != Some(commands::socks_proxy_string(socks_address).as_str()) {
+            return Err(AdapterError::NetworkConfigMismatch {
+                expected: socks_address,
+                actual,
+            });
+        }
+        Ok(())
     }
 
     /// Start the chat controller and read back the active user profile that
@@ -160,6 +190,18 @@ fn extract_user_id(response: &serde_json::Value) -> Result<i64, AdapterError> {
         .ok_or_else(|| AdapterError::UnexpectedResponse(response.clone()))
 }
 
+/// Reads `CRNetworkConfig`'s `networkConfig.socksProxy` field back out of an
+/// `APIGetNetworkConfig` response. `None` if the field is absent/not a string, which
+/// [`SimplexAdapter::configure_network`] treats the same as any other mismatch - fail closed,
+/// not "assume no proxy is fine".
+fn extract_socks_proxy(response: &serde_json::Value) -> Option<String> {
+    response
+        .get("networkConfig")?
+        .get("socksProxy")?
+        .as_str()
+        .map(str::to_owned)
+}
+
 fn extract_invitation_link(response: &serde_json::Value) -> Result<String, AdapterError> {
     response
         .get("connLinkInvitation")
@@ -227,5 +269,25 @@ mod tests {
     fn extract_invitation_link_rejects_a_response_missing_the_field() {
         let response = serde_json::json!({"type": "chatStarted"});
         assert!(extract_invitation_link(&response).is_err());
+    }
+
+    #[test]
+    fn extracts_socks_proxy_from_a_network_config_response() {
+        // Shape per `CRNetworkConfig {networkConfig :: NetworkConfig}` - see
+        // `commands.rs`'s network-config section doc comment for the field-name provenance.
+        let response = serde_json::json!({
+            "type": "networkConfig",
+            "networkConfig": {"socksProxy": "127.0.0.1:9999", "socksMode": "always"}
+        });
+        assert_eq!(
+            extract_socks_proxy(&response).as_deref(),
+            Some("127.0.0.1:9999")
+        );
+    }
+
+    #[test]
+    fn extract_socks_proxy_rejects_a_response_missing_the_field() {
+        let response = serde_json::json!({"type": "chatStarted"});
+        assert!(extract_socks_proxy(&response).is_none());
     }
 }
