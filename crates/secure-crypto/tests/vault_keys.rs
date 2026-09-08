@@ -56,6 +56,24 @@ fn database_and_config_subkeys_are_domain_separated() {
 }
 
 #[test]
+fn messaging_database_subkey_is_domain_separated() {
+    let key = VaultKey::generate().expect("OS randomness");
+
+    let messaging = key
+        .derive_subkey(SubkeyPurpose::MessagingDatabaseV1)
+        .expect("derive messaging database key");
+    let database = key
+        .derive_subkey(SubkeyPurpose::DatabaseV1)
+        .expect("derive database key");
+    let config = key
+        .derive_subkey(SubkeyPurpose::LocalConfigV1)
+        .expect("derive config key");
+
+    assert_ne!(&*messaging, &*database);
+    assert_ne!(&*messaging, &*config);
+}
+
+#[test]
 fn repeated_generate_and_drop_does_not_panic() {
     // VaultKey locks its heap-allocated buffer in physical memory on construction
     // (best-effort mlock/VirtualLock) and unlocks it on drop. This does not - and cannot,

@@ -249,22 +249,48 @@ Upstream SimpleX already exposes native core initialization with an in-memory da
 
 ## Work
 
-- [ ] Add `SubkeyPurpose::MessagingDatabaseV1` to `secure-crypto` with a dedicated HKDF label such as `messaging-database-v1`.
+- [x] Add `SubkeyPurpose::MessagingDatabaseV1` to `secure-crypto` with a dedicated HKDF label such as `messaging-database-v1`. (Landed with label `messaging-database-v1`, domain-separated from `DatabaseV1`/`LocalConfigV1` by HKDF `expand`'s `info` parameter, same mechanism the existing two purposes already used.)
 - [ ] Derive the SimpleX database key from the random VMK, never directly from the human passphrase.
+      Not yet actionable: nothing in the workspace currently derives a messaging database key at
+      all, because messaging is not wired into the desktop host (that wiring is R5).
+      `SimplexClient::launch`/`SimplexAdapter::bootstrap` already take an opaque
+      `Zeroizing<String>` from their caller and never see a passphrase, so the crate-level
+      contract already satisfies this; the concrete "call `derive_subkey(MessagingDatabaseV1)`
+      on the unlocked VMK and hand the result to `launch`" wiring belongs to R5's runtime code,
+      once that runtime exists to call it from.
 - [ ] Implement a production SimpleX core wrapper that passes the database key through the native API in memory.
-- [ ] Keep key buffers in `Zeroizing`/equivalent secret containers and do not log/debug-format them.
-- [ ] Ensure no production launch path places the messaging DB key in argv, environment variables, temporary files, or Tauri IPC.
-- [ ] Make the existing CLI subprocess adapter explicitly integration-test/dev-only once the native path is usable.
-- [ ] Package the required SimpleX native library artifacts under an auditable AGPL-compatible build/release process for Windows and Linux; do not download mutable binaries at application runtime.
-- [ ] Record exact upstream version/commit and license provenance in release metadata.
+      **Blocked, not fake-completed:** this requires linking upstream `simplex-chat`'s native
+      core (Haskell, exposing `chatMigrateInit`/`chat_migrate_init` via FFI) and its actual
+      compiled shared library. That artifact is not vendored in this repository and this
+      environment has no network access to fetch or build it. Writing FFI binding code against a
+      library that cannot be linked or exercised here would be unverifiable and is exactly the
+      kind of scaffolding-for-later this project's own discipline forbids; it is intentionally
+      not implemented rather than added as dead code. Unblocking this needs, in order: (1)
+      obtaining/building the upstream native core artifact for Linux and Windows, (2) writing
+      `crates/secure-messaging/src/simplex/core.rs` against its real header/API surface with a
+      live round-trip test the way `client.rs`/`adapter.rs` were verified against the real CLI
+      binary, (3) the packaging step below.
+- [x] Keep key buffers in `Zeroizing`/equivalent secret containers and do not log/debug-format
+      them. (Already true of the existing CLI path: `SimplexClient::launch` takes
+      `&Zeroizing<String>`, never stores the key in `Self`, and no `Debug` impl in this module
+      touches it. Re-verify once the native wrapper above exists.)
+- [ ] Ensure no production launch path places the messaging DB key in argv, environment variables, temporary files, or Tauri IPC. Depends on the native wrapper above; the only launch path that exists today is the CLI one, which is documented as dev/integration-only rather than production, not fixed to avoid argv exposure (it cannot be, per the CLI's own interface).
+- [x] Make the existing CLI subprocess adapter explicitly integration-test/dev-only. Done ahead of
+      the native path existing, rather than waiting for it: `client.rs` and `simplex/mod.rs` now
+      both state outright that `SimplexClient`'s CLI subprocess is a compatibility/dev harness,
+      not an acceptable production secret boundary, and must not be wired into a production
+      launch path.
+- [ ] Package the required SimpleX native library artifacts under an auditable AGPL-compatible build/release process for Windows and Linux; do not download mutable binaries at application runtime. Blocked on the native wrapper existing first.
+- [ ] Record exact upstream version/commit and license provenance in release metadata. Blocked on the native wrapper existing first.
 
 ## Required regression tests
 
-- [ ] `messaging_database_subkey_is_domain_separated` proves it differs from DatabaseV1 and LocalConfigV1.
-- [ ] native SimpleX store created with a generated key cannot be reopened with another key.
-- [ ] raw SimpleX database files do not contain a planted plaintext message/profile marker.
-- [ ] test process inspection confirms the production path exposes no messaging database key in command line or environment.
-- [ ] lock drops the in-memory messaging DB key and closes the SimpleX store.
+- [x] `messaging_database_subkey_is_domain_separated` proves it differs from DatabaseV1 and
+      LocalConfigV1 (`crates/secure-crypto/tests/vault_keys.rs`).
+- [ ] native SimpleX store created with a generated key cannot be reopened with another key. Blocked on the native wrapper.
+- [ ] raw SimpleX database files do not contain a planted plaintext message/profile marker. Blocked on the native wrapper.
+- [ ] test process inspection confirms the production path exposes no messaging database key in command line or environment. Blocked on the native wrapper.
+- [ ] lock drops the in-memory messaging DB key and closes the SimpleX store. Blocked on R5 (no runtime owns a messaging DB key yet) and the native wrapper.
 
 ## Verification
 

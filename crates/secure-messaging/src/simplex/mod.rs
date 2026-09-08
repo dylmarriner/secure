@@ -13,6 +13,13 @@
 //! That is "linking SimpleX's implementation" in the sense the licensing decision covers (this
 //! crate's own release still needs to ship or depend on that AGPLv3 binary), just not in the
 //! sense of `cargo` dependency linking.
+//!
+//! See `docs/security-remediation-plan.md` Phase R3: this CLI subprocess path is an
+//! integration-test/dev-only adapter, not the production secret-delivery boundary, because it
+//! necessarily places the database encryption key in this process's argv (`client.rs` module
+//! docs explain why there is no better flag). Production requires linking upstream's native core
+//! and its in-memory key API instead - blocked on an upstream native library artifact this
+//! repository does not currently vendor or have network access to build.
 
 pub(crate) mod adapter;
 pub(crate) mod client;

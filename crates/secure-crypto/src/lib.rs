@@ -140,6 +140,10 @@ impl Drop for VaultKey {
 pub enum SubkeyPurpose {
     DatabaseV1,
     LocalConfigV1,
+    /// Key for the SimpleX messaging database (`secure-messaging`). Domain-separated from
+    /// `DatabaseV1` (Secure's own SQLCipher vault) so a compromise or reuse of one key can never
+    /// unlock the other, even though both derive from the same `VaultKey`.
+    MessagingDatabaseV1,
 }
 
 impl SubkeyPurpose {
@@ -147,6 +151,7 @@ impl SubkeyPurpose {
         match self {
             Self::DatabaseV1 => b"database-v1",
             Self::LocalConfigV1 => b"local-config-v1",
+            Self::MessagingDatabaseV1 => b"messaging-database-v1",
         }
     }
 }

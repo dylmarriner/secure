@@ -42,6 +42,20 @@
 //!
 //! Not yet run this way: a second instance actually accepting an invitation from the first and
 //! a real end-to-end message round trip. See `docs/implementation-plan.md` Phase 3.
+//!
+//! # This is the CLI integration harness, not the production secret-delivery path
+//!
+//! `docs/security-remediation-plan.md` Phase R3 requires that no production launch path place
+//! the SimpleX database key in this process's argv. The upstream `simplex-chat` CLI has no other
+//! way to take that key - see the `-k`/`--key` note above - so this module's [`SimplexClient`]
+//! is explicitly retained as an integration-test/dev-only adapter, kept because it is a real,
+//! working, independently useful compatibility harness against the actual upstream binary, not
+//! because it is an acceptable production boundary. The production path requires linking
+//! upstream's native core and calling its in-memory key API (`chatMigrateInit`/
+//! `chat_migrate_init`) instead of spawning this CLI; that needs the actual upstream native
+//! library artifact (build/FFI headers, a packaged `.so`/`.dll`) which is not vendored in or
+//! reachable from this repository/environment, so it is not implemented here rather than being
+//! faked with an unlinkable stub. Do not wire this module into a production launch path.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
