@@ -1,10 +1,29 @@
-use secure_crypto::{Argon2Profile, SubkeyPurpose, VaultKey, VaultKeyEnvelope};
+use secure_crypto::{
+    Argon2Profile, SubkeyPurpose, VaultKey, VaultKeyEnvelope, open_messaging_record,
+    seal_messaging_record,
+};
 
 const TEST_PROFILE: Argon2Profile = Argon2Profile {
     memory_kib: 8 * 1024,
     iterations: 1,
     parallelism: 1,
 };
+
+#[test]
+fn messaging_records_round_trip_and_authenticate_metadata() {
+    let key = VaultKey::generate().expect("test randomness");
+    let ciphertext =
+        seal_messaging_record(&key, "conversation-1", "incoming", b"hello").expect("seal record");
+
+    assert_ne!(ciphertext, b"hello");
+    assert_eq!(
+        open_messaging_record(&key, "conversation-1", "incoming", &ciphertext)
+            .expect("open record"),
+        b"hello"
+    );
+    assert!(open_messaging_record(&key, "conversation-2", "incoming", &ciphertext).is_err());
+    assert!(open_messaging_record(&key, "conversation-1", "outgoing", &ciphertext).is_err());
+}
 
 #[test]
 fn vault_key_round_trips_through_authenticated_passphrase_envelope() {

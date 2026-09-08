@@ -28,6 +28,10 @@ const MIGRATIONS: &[Migration] = &[
         from_version: 1,
         sql: include_str!("migrations/0002_foreign_key_indexes.sql"),
     },
+    Migration {
+        from_version: 2,
+        sql: include_str!("migrations/0003_contact_external_id.sql"),
+    },
 ];
 
 pub(crate) fn migrate_to_latest(

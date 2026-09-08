@@ -39,6 +39,16 @@ pub fn show_active_user() -> String {
     "/user".to_owned()
 }
 
+/// `/_create user <json(newUser)>` - create the first local profile when the native core opens a
+/// fresh store. The CLI adapter does not use this: its `--user-display-name` launch option
+/// creates the profile before the WebSocket API is available. The native core has no equivalent
+/// launch option, so its bootstrap path must create the profile after `/_start` reports
+/// `noActiveUser`.
+#[cfg(feature = "simplex-native")]
+pub fn create_native_user() -> String {
+    "/_create user {\"profile\":{\"displayName\":\"Secure\",\"fullName\":\"\"},\"pastTimestamp\":false,\"userChatRelay\":false,\"clientService\":false}".to_owned()
+}
+
 /// `/_connect <userId>` with no link argument - `APIAddContact`: create a one-time invitation
 /// link. Distinguished from [`connect_via_link`] (same `/_connect` prefix) purely by the
 /// presence or absence of the trailing link argument, exactly as the upstream API reference

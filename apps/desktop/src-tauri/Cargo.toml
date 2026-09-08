@@ -12,13 +12,21 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 secure-core = { path = "../../../crates/secure-core" }
 secure-crypto = { path = "../../../crates/secure-crypto" }
+secure-messaging = { path = "../../../crates/secure-messaging" }
 secure-storage = { path = "../../../crates/secure-storage" }
 secure-transport = { path = "../../../crates/secure-transport" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[features]
+# Wires the production SimpleX native core (Phase R5, docs/security-remediation-plan.md) into
+# `messaging.rs`. Requires `libsimplex.so` built by `scripts/build-simplex-native.sh` and
+# `SECURE_SIMPLEX_NATIVE_LIB_DIR` set - see that crate's feature of the same name.
+simplex-native = ["secure-messaging/simplex-native", "dep:tokio"]

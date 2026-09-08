@@ -255,7 +255,6 @@ fn run_stage(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ConversationRecord, MessageRecord};
     use secure_crypto::VaultKey;
 
     fn open_test_vault() -> (tempfile::TempDir, Vault) {
@@ -267,21 +266,12 @@ mod tests {
     }
 
     fn seed_conversation_with_attachment(vault: &mut Vault) -> (String, String, String) {
-        let conversation_id = crate::schema::insert_conversation(
-            vault,
-            &ConversationRecord {
-                local_alias: "burn-target".into(),
-            },
-        )
-        .expect("insert conversation");
-        let message_id = crate::schema::insert_message(
-            vault,
-            &MessageRecord {
-                conversation_id: conversation_id.clone(),
-                ciphertext: b"secret content".to_vec(),
-            },
-        )
-        .expect("insert message");
+        let conversation_id = vault
+            .insert_conversation("burn-target")
+            .expect("insert conversation");
+        let message_id = vault
+            .insert_outgoing_message(&conversation_id, b"secret content")
+            .expect("insert message");
         let attachment_id = random_id();
         vault
             .connection_mut()

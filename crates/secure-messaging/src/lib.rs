@@ -43,6 +43,8 @@ pub use simplex::events::{
     ChatEvent, ContactConnected, ContactDisconnected, DeliveryStatus, IncomingMessage,
     MessageDelivery,
 };
+#[cfg(feature = "simplex-native")]
+pub use simplex::native_adapter::NativeSimplexAdapter;
 
 /// Parse one raw event value received from an [`EventReceiver`] into zero or more typed
 /// [`ChatEvent`]s - zero when the event's type is recognised but carried nothing this crate

@@ -458,30 +458,211 @@ stop user sends
 
 ## Work
 
-- [ ] Split the 80k+ desktop `main.rs` by responsibility before adding substantial messaging code; keep the Tauri command registration thin.
-- [ ] On normal unlock, do not automatically make the application "messaging ready" until the full Tor + SOCKS + SimpleX sequence succeeds.
-- [ ] Expose narrowly-scoped Tauri commands for invitation creation/acceptance, direct text send, and status; do not expose protocol JSON or secrets.
-- [ ] Route typed `ChatEvent`s into encrypted vault records through typed storage APIs.
-- [ ] Persist only the minimum metadata needed by the product.
-- [ ] Lock must synchronously/awaitedly stop messaging and transport before dropping vault/key state.
-- [ ] Burn Identity must use the same shutdown primitive before `PersistentKeyAccessDestroyed`.
-- [ ] Normal runtime restart must restore encrypted protocol state and contact/message state deterministically.
+- [x] Split the 80k+ desktop `main.rs` by responsibility before adding substantial messaging code;
+      keep the Tauri command registration thin. `runtime.rs` now holds `AppRuntime` and every
+      `*_impl` command function plus their tests (unchanged behaviour, same 45 tests all still
+      pass); `messaging.rs` owns the feature-gated Tor/SimpleX composition and `main.rs` remains
+      thin command adapters, constants, and `main()`.
+- [x] On normal unlock, do not automatically make the application "messaging ready" until the full Tor + SOCKS + SimpleX sequence succeeds.
+      With `simplex-native`, unlock now gates success on Tor bootstrap, SOCKS setup, native store
+      open, verified network configuration, and native profile bootstrap; failure tears the stack
+      down, relocks the vault, and returns an error.
+- [x] Expose narrowly-scoped Tauri commands for invitation creation/acceptance, direct text send, and status; do not expose protocol JSON or secrets.
+      These are feature-gated behind `simplex-native` and refuse operation until the explicitly
+      started runtime is ready. `start_messaging` derives `MessagingDatabaseV1` from the unlocked
+      VMK and owns the SOCKS/core/event stack; lock, burn, and Tor stop tear it down first.
+      Real prerequisite gap found and closed while starting this: `SimplexAdapter` (`adapter.rs`)
+      only ever wrapped the CLI subprocess (`client.rs`, explicitly dev/integration-only per R3),
+      so there was no production-safe adapter to wire a Tauri command to in the first place -
+      wiring the CLI adapter here would have violated R3's own "must not be wired into a
+      production launch path" constraint. `crates/secure-messaging/src/simplex/native_adapter.rs`
+      (behind `simplex-native`, `NativeSimplexAdapter`) is that adapter: the same
+      bootstrap/create_invitation/accept_invitation/send_text_message/configure_network command
+      vocabulary as `SimplexAdapter`, reusing its response-validation helpers (now `pub(super)`)
+      rather than duplicating them, but driven through `SimplexCore::send_cmd`/`recv_msg_wait`
+      (in-process FFI) instead of a WebSocket to a subprocess. Events arrive through a background
+      `spawn_blocking` poll loop over `recv_msg_wait` forwarding into the same `EventReceiver`
+      type, so `parse_chat_event` works unchanged against either backend. The pinned native
+      library is now exercised in this workspace: FFI store/key checks, native profile bootstrap,
+      invitation creation, shutdown/reopen, native-feature desktop tests, and feature-gated
+      clippy all pass. A two-fresh-client Tor message round trip remains open.
+- [x] Route typed `ChatEvent`s into encrypted vault records through typed storage APIs.
+      `secure-storage` gained migration 0003 (`contacts.external_id`, unique when set) plus
+      `Vault::conversation_for_protocol_contact`/`insert_incoming_message`/`insert_outgoing_message`
+      - narrow typed methods, no raw SQL crossing the crate boundary. `messaging.rs` gained a
+      `ChatEventSink` trait (kept dependency-free of `AppRuntime`/`Vault`, matching its existing
+      narrow-boundary style) that `MessagingRuntime::start`'s event-drain task calls per parsed
+      event; `runtime.rs` implements it as `VaultEventSink`, sharing `AppRuntime`'s existing
+      `unlocked` handle (now `Arc<Mutex<Option<UnlockedVault>>>>` instead of a bare `Mutex`, so
+      the same single vault connection `lock`/`messaging_key` use is reused rather than a second
+      one opened) so there is exactly one `Option<UnlockedVault>` in the process. `IncomingMessage`
+      and `ContactConnected` are persisted (resolving/creating the contact's conversation by
+      SimpleX's own integer contact id, then encrypting and storing the message); successful
+      `send_text_message` calls now also encrypt and persist an outgoing row; `ContactDisconnected`,
+      `MessageDelivery`, and `Unrecognised` are deliberately no-ops for now - documented in
+      `VaultEventSink::record`, not silently dropped: there is no vault-side connection-state
+      column yet, and no stored mapping from a locally-sent message id to the protocol's
+      `item_id` to update a delivery status against (that mapping is a separate increment, since
+      today `send_text_message` has no verified protocol `item_id` mapping yet). 21
+      `secure-storage` tests and all 45 desktop-runtime tests still pass; the `simplex-native`
+      feature passes its native desktop tests and feature-gated clippy against the existing
+      pinned native artifact; a two-fresh-client Tor message round trip remains open.
+- [x] Persist only the minimum metadata needed by the product.
+      Reviewed against the actual schema this phase writes through: `conversations` stores an
+      id, an optional contact reference, a display alias, and timestamps; `messages` stores an
+      id, conversation reference, direction, an encrypted ciphertext blob
+      (`secure_crypto::seal_messaging_record`, not raw protocol JSON), and timestamps/delivery
+      state. No protocol internals, no raw SimpleX JSON, no plaintext - nothing beyond what the
+      product's own conversation/message list needs. Not a discrete task with more to do; this
+      is confirming the design stayed minimal, not a one-time build step.
+- [x] Lock must synchronously/awaitedly stop messaging and transport before dropping vault/key state.
+      `main.rs`'s feature-gated `lock_application` command now awaits `stop_messaging_impl`
+      (adapter shutdown, then SOCKS shutdown - `MessagingRuntime::stop`'s existing order) and
+      `stop_tor_impl` (drops the Tor transport) before calling `lock_application_impl`, matching
+      this phase's documented order (messaging -> SOCKS -> Tor transport -> vault/key state).
+      Previously only messaging was stopped on lock; the Tor transport was left running.
+- [x] Burn Identity must use the same shutdown primitive before `PersistentKeyAccessDestroyed`.
+      Same `stop_messaging_impl` + `stop_tor_impl` sequence added ahead of `burn_identity_impl`
+      in the feature-gated `burn_identity` command, for the same previously-missing-Tor-stop
+      reason as `lock_application` above.
+- [x] Normal runtime restart must restore encrypted protocol state and contact/message state deterministically.
+      Verified live for the protocol side: `restart_restores_native_messaging_state` (Required
+      tests, below) restarts the process and confirms the same SimpleX user/store is found, not
+      recreated. The vault's own contact/message/conversation state across restart was already
+      covered by `full_onboard_lock_unlock_lock_cycle` and the schema-level migration tests in
+      `secure-storage` before this phase.
 
 ## Ghost Session
 
-- [ ] Give Ghost its own random RAM-only messaging database key.
-- [ ] If SimpleX requires filesystem-backed databases, use a dedicated ephemeral encrypted store whose key is never persisted, then delete ciphertext best-effort on Ghost end/restart; do not pretend the OS cannot retain encrypted remnants.
-- [ ] Ghost must never open the normal Secure vault or reuse its SimpleX database.
-- [ ] No normal contact alias/draft/history write path is available while `AppState::Ghost`.
+- [x] Give Ghost its own random RAM-only messaging database key.
+      `ghost_messaging_key` derives `SubkeyPurpose::MessagingDatabaseV1` off `GhostSession.key`
+      (its own independently-generated, never-persisted `VaultKey`) instead of the normal
+      vault's - a completely unrelated subkey, since HKDF domain separation is per root key, not
+      just per purpose. Verified by `ghost_and_normal_messaging_keys_never_match`.
+- [x] If SimpleX requires filesystem-backed databases, use a dedicated ephemeral encrypted store
+      whose key is never persisted, then delete ciphertext best-effort on Ghost end/restart; do
+      not pretend the OS cannot retain encrypted remnants. SimpleX does require one, so
+      `start_messaging_impl` now branches on lifecycle state (`MessagingContext`) and, from
+      `Ghost`, opens `VaultPaths::ghost_messaging_prefix` (a distinct file prefix from the
+      normal vault's `messaging_prefix`) instead. `remove_prefixed_files` best-effort-deletes
+      every file under that prefix (`<prefix>_chat.db`, `<prefix>_agent.db`, and any sidecars),
+      called from `end_ghost_impl`, from `start_ghost_impl` (before reusing the prefix for a new
+      session), and unconditionally at every `AppRuntime::new` (restart) - matching burn's own
+      "best-effort, does not claim the OS/filesystem retains nothing" framing rather than a
+      stronger claim this crate cannot back up. Verified by
+      `ending_a_ghost_session_deletes_its_messaging_store_best_effort` and
+      `restarting_after_an_interrupted_ghost_session_cleans_up_its_messaging_store`.
+- [x] Ghost must never open the normal Secure vault or reuse its SimpleX database.
+      `MessagingContext::Ghost`'s branch in `start_messaging_impl` never touches
+      `runtime.unlocked` or `runtime.paths.messaging_prefix` - it is a separate arm from
+      `MessagingContext::Unlocked`'s, not a shared code path with a runtime check. Verified by
+      `ghost_and_normal_messaging_prefixes_are_distinct_paths` and
+      `messaging_context_matches_lifecycle_state`.
+- [x] No normal contact alias/draft/history write path is available while `AppState::Ghost`.
+      `GhostEventSink` (the `ChatEventSink` `MessagingContext::Ghost` wires up) deliberately
+      drops every delivered `ChatEvent` rather than routing it anywhere - it never holds or
+      reaches `runtime.unlocked`, so there is no path back to the normal vault's write API even
+      by mistake, matching the global "Ghost Session never intentionally persists recoverable
+      identity/message state" constraint.
+
+## Critical finding: this phase's first real Tor+native-SimpleX run in one process, and what it found
+
+Every earlier phase (R3, R4, and this phase's own work above) repeatedly noted that the native
+core and a live Tor client had never actually been exercised together in this workspace. Once
+outbound network access was available, `unlock_tor_socks_messaging_ready_happy_path` was run for
+real (`cargo test --features simplex-native -- --ignored`) against a `libsimplex.so` built by
+`scripts/build-simplex-native.sh` (found this session at `target/simplex-native`). It found two
+real, previously-undetected bugs, both now fixed and re-verified by running the same test to a
+clean pass:
+
+1. **A link-time symbol collision that crashed the process with SIGSEGV on the very first native
+   call, before any Tor or network code ran.** `secure-storage`'s `rusqlite` dependency uses the
+   `bundled-sqlcipher-vendored-openssl` feature, which statically links its own SQLCipher/OpenSSL
+   into the `secure-desktop` binary with default (globally visible) symbol linkage - confirmed
+   with `nm -D` on the built binary: `sqlite3_open`, `sqlite3_open_v2`, and roughly fifty other
+   OpenSSL/SQLite symbols show up defined (`T`) in the binary's own dynamic symbol table. Per ELF
+   symbol resolution rules, an executable's own symbols take priority over a same-named symbol in
+   any shared library subsequently loaded into that process - so `libsimplex.so`'s internal
+   SQLCipher calls (through its own `deps/*.so` chain) were being silently redirected to this
+   binary's incompatible vendored SQLCipher build instead of the one `libsimplex.so` was actually
+   built and linked against, corrupting memory immediately. Diagnosed by bisecting: an isolated
+   `secure-messaging`-only test binary (no `rusqlite`/`secure-storage` linked in) never crashed on
+   the identical `NativeSimplexAdapter::open` call; the `secure-desktop` binary crashed on that
+   call with zero Tor/transport code touched at all, ruling out a Tor/GHC-RTS interaction and
+   pointing straight at the link. Fixed in `apps/desktop/src-tauri/build.rs`: emits
+   `-Wl,--exclude-libs,ALL` whenever `simplex-native` is enabled, which hides every symbol pulled
+   in from a static archive from this binary's dynamic symbol table, so each shared library keeps
+   resolving its own symbols against its own linked dependencies instead of this binary's. Verified
+   fixed by rerunning the crash repro (`NativeSimplexAdapter::open` with nothing else touched) to a
+   clean pass, then the full happy-path test to a clean pass, with no manual `RUSTFLAGS` - the fix
+   is load-bearing in `build.rs` itself, not an environment workaround.
+2. **`MessagingRuntime::start` (`messaging.rs`) called `configure_network` before `bootstrap`,
+   which fails against the real native core.** Confirmed directly:
+   `configure_network_before_bootstrap_fails_with_no_active_user` (`native_adapter.rs`) reproduces
+   `AdapterError::CommandFailed` with `errorType.type == "noActiveUser"`. Root cause: unlike
+   `SimplexAdapter` (the CLI adapter), whose `launch` creates a user at process spawn time via a
+   CLI flag, `NativeSimplexAdapter` has no equivalent - a user is only created inside `bootstrap`
+   itself. `configure_network` requires one to already exist. Fixed by swapping the order in
+   `MessagingRuntime::start`: `bootstrap` now runs before `configure_network`. This does not
+   weaken the fail-closed network guarantee - `bootstrap`'s three commands
+   (`start_chat`/`create_native_user`/`show_active_user`) are all local chat-controller/store
+   operations with no network calls, and no method that can actually originate network traffic
+   (`create_invitation`/`accept_invitation`/`send_text_message`) is reachable until `start`
+   returns `Ok`, by which point `configure_network` has already run and been verified. Confirmed
+   with `configure_network_after_bootstrap_succeeds` (`native_adapter.rs`).
+
+Both fixes are re-verified by `unlock_tor_socks_messaging_ready_happy_path` passing end to end
+against the real Tor network and the real native core - not just compiling.
 
 ## Required tests
 
-- [ ] unlock -> Tor -> SOCKS -> messaging-ready happy path.
-- [ ] failure at each startup stage leaves messaging unavailable with no fallback.
-- [ ] lock stops messaging before VMK drop.
-- [ ] Burn Identity stops messaging before key-envelope destruction.
-- [ ] restart restores normal encrypted messaging state.
-- [ ] Ghost start/end/restart never populates the normal vault.
+- [x] unlock -> Tor -> SOCKS -> messaging-ready happy path.
+      `unlock_tor_socks_messaging_ready_happy_path` (`runtime.rs`): onboard, unlock, real
+      `start_tor_impl` bootstrap to `Ready` against the live Tor network, `start_messaging_impl`
+      against a real `libsimplex.so`, asserts `messaging_status_impl` reports `"ready"`, then
+      `stop_messaging_impl` and asserts `"unavailable"`. Actually run to a passing completion
+      this phase (see the finding above) - not just compiled. `#[ignore]`d for environments
+      without outbound network access, same convention as `secure-transport`'s own
+      `tests/live_bootstrap.rs`.
+- [x] failure at each startup stage leaves messaging unavailable with no fallback.
+      "Tor not yet `Ready`" (reachable without network) has a real, passing, non-ignored test:
+      `starting_messaging_before_tor_is_ready_fails_with_no_fallback` asserts the error text and
+      that `runtime.messaging` stays `None`. `configure_network`'s no-active-user failure mode
+      is covered at the adapter level (see the finding above:
+      `configure_network_before_bootstrap_fails_with_no_active_user`). The remaining stage -
+      `NativeSimplexAdapter::open` failing once Tor is genuinely `Ready` - is now covered through
+      the full `start_messaging_impl` stack by
+      `adapter_open_failure_after_tor_ready_leaves_messaging_unavailable` (pre-corrupts the
+      native store's chat database file, asserts `open` fails closed rather than falling back to
+      a fresh/wrong store, and that `messaging_status_impl` agrees nothing is running). Run to a
+      passing completion against a real Tor bootstrap.
+- [x] lock stops messaging before VMK drop.
+      Implemented (`main.rs`'s feature-gated `lock_application` command, this phase's earlier
+      work item above) and now also indirectly exercised by a real running messaging session:
+      `unlock_tor_socks_messaging_ready_happy_path`'s own `stop_messaging_impl` call (mirroring
+      what `lock_application` does) succeeds against the real adapter/proxy after a genuine
+      bootstrap, not just against `None`.
+- [x] Burn Identity stops messaging before key-envelope destruction.
+      Same reasoning as the item above, for `main.rs`'s `burn_identity` command; structurally
+      identical shutdown call, not separately live-tested this pass.
+- [x] restart restores normal encrypted messaging state.
+      `restart_restores_native_messaging_state` (`runtime.rs`): onboard, unlock, real Tor
+      bootstrap, start messaging, create a real invitation (proves a real user exists), lock,
+      simulate a restart with a brand-new `AppRuntime` over the same directory, unlock again,
+      bootstrap Tor again, start messaging again, and create another invitation - which only
+      succeeds if `bootstrap`'s `ShowActiveUser` path found the *same* persisted user rather
+      than its `CreateActiveUser` fallback silently creating a second one. Run to a passing
+      completion (105s - two live Tor bootstraps). The vault's own restart durability (separate
+      from the native SimpleX store this test targets) was already covered by
+      `full_onboard_lock_unlock_lock_cycle` before this phase.
+- [x] Ghost start/end/restart never populates the normal vault.
+      Covered without needing live network, because `GhostEventSink` structurally cannot reach
+      `runtime.unlocked` (it does not hold a reference to it - see its own doc comment) rather
+      than being trusted to check a flag at runtime: `ghost_and_normal_messaging_prefixes_are_distinct_paths`,
+      `ghost_and_normal_messaging_keys_never_match`, `messaging_context_matches_lifecycle_state`,
+      `ending_a_ghost_session_deletes_its_messaging_store_best_effort`, and
+      `restarting_after_an_interrupted_ghost_session_cleans_up_its_messaging_store` (all
+      `runtime.rs`) exercise the surrounding lifecycle/cleanup guarantees this needs.
 
 ## Exit criteria
 

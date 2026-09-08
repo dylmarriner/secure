@@ -7,7 +7,6 @@
 
 pub mod burn;
 mod migrations;
-#[cfg(test)]
 mod schema;
 
 use std::fmt;
@@ -22,7 +21,7 @@ use zeroize::Zeroizing;
 ///
 /// Persistent formats are versioned per the project engineering rules: bumping this value
 /// must be paired with a new entry in [`migrations::MIGRATIONS`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -61,6 +60,43 @@ impl fmt::Debug for Vault {
 }
 
 impl Vault {
+    /// Create a conversation row and return its opaque identifier.
+    pub fn insert_conversation(&mut self, local_alias: &str) -> Result<String, StorageError> {
+        schema::insert_conversation(self, local_alias)
+    }
+
+    /// Resolve (creating on first sight) the conversation for a protocol-assigned contact id -
+    /// e.g. the integer contact id SimpleX's chat events carry, which is not this vault's
+    /// opaque contact/conversation id. Reuses the same conversation for every event about the
+    /// same contact rather than creating a new one per event.
+    pub fn conversation_for_protocol_contact(
+        &mut self,
+        external_contact_id: i64,
+        fallback_alias: &str,
+    ) -> Result<String, StorageError> {
+        schema::find_or_create_conversation_for_contact(self, external_contact_id, fallback_alias)
+    }
+
+    /// Store an incoming protocol ciphertext. Plaintext is deliberately not accepted here; the
+    /// messaging layer must encrypt it before crossing this boundary.
+    pub fn insert_incoming_message(
+        &mut self,
+        conversation_id: &str,
+        ciphertext: &[u8],
+    ) -> Result<String, StorageError> {
+        schema::insert_message_with_direction(self, conversation_id, ciphertext, "incoming")
+    }
+
+    /// Store an outgoing protocol ciphertext. Plaintext is deliberately not accepted here; the
+    /// messaging layer must encrypt it before crossing this boundary.
+    pub fn insert_outgoing_message(
+        &mut self,
+        conversation_id: &str,
+        ciphertext: &[u8],
+    ) -> Result<String, StorageError> {
+        schema::insert_message_with_direction(self, conversation_id, ciphertext, "outgoing")
+    }
+
     /// Create a brand-new encrypted vault at `path`.
     ///
     /// Fails if a file already exists at `path` so that a caller cannot accidentally
@@ -124,7 +160,7 @@ impl Vault {
     }
 
     /// Direct connection access for record-level work within this crate: the typed insert
-    /// helpers in `schema` under `#[cfg(test)]`, and the real [`burn`] module.
+    /// helpers in `schema` and the real [`burn`] module.
     pub(crate) fn connection_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
@@ -299,30 +335,18 @@ mod tests {
 
     #[test]
     fn no_application_controlled_plaintext_message_persistence() {
-        use schema::{ConversationRecord, MessageRecord};
-
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.db");
         let vault_key = key();
         let mut vault = Vault::create_new(&path, &vault_key).expect("create");
 
         let secret_marker = "correct horse battery staple do not leak me";
-        let conversation_id = schema::insert_conversation(
-            &mut vault,
-            &ConversationRecord {
-                local_alias: "test-contact".into(),
-            },
-        )
-        .expect("insert conversation");
-
-        schema::insert_message(
-            &mut vault,
-            &MessageRecord {
-                conversation_id,
-                ciphertext: secret_marker.as_bytes().to_vec(),
-            },
-        )
-        .expect("insert message");
+        let conversation_id = vault
+            .insert_conversation("test-contact")
+            .expect("insert conversation");
+        vault
+            .insert_outgoing_message(&conversation_id, secret_marker.as_bytes())
+            .expect("insert message");
 
         drop(vault);
 
@@ -334,48 +358,75 @@ mod tests {
     }
 
     #[test]
-    fn migrating_forward_preserves_existing_encrypted_state() {
-        use schema::{ConversationRecord, MessageRecord};
+    fn public_message_api_persists_only_ciphertext_and_preserves_direction() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.db");
+        let vault_key = key();
+        let mut vault = Vault::create_new(&path, &vault_key).expect("create");
+        let conversation_id = vault
+            .insert_conversation("alice")
+            .expect("insert conversation");
 
+        let incoming_id = vault
+            .insert_incoming_message(&conversation_id, b"encrypted incoming")
+            .expect("insert incoming message");
+        let outgoing_id = vault
+            .insert_outgoing_message(&conversation_id, b"encrypted outgoing")
+            .expect("insert outgoing message");
+
+        let incoming_direction: String = vault
+            .connection()
+            .query_row(
+                "SELECT direction FROM messages WHERE id = ?1;",
+                rusqlite::params![incoming_id],
+                |row| row.get(0),
+            )
+            .expect("read incoming direction");
+        let outgoing_direction: String = vault
+            .connection()
+            .query_row(
+                "SELECT direction FROM messages WHERE id = ?1;",
+                rusqlite::params![outgoing_id],
+                |row| row.get(0),
+            )
+            .expect("read outgoing direction");
+
+        assert_eq!(incoming_direction, "incoming");
+        assert_eq!(outgoing_direction, "outgoing");
+    }
+
+    #[test]
+    fn migrating_forward_preserves_existing_encrypted_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("vault.db");
         let vault_key = key();
 
-        // Build a vault the way an already-deployed build that only shipped migration 0001
-        // would have: create it, insert real data, then roll it back to schema version 1 by
-        // dropping the objects migration 0002 adds. This is what an existing user's vault on
-        // disk actually looks like right before they upgrade to a build carrying 0002.
+        // Build a vault the way an already-deployed build that only shipped migration 0002
+        // would have: create it, insert real data, then roll it back to schema version 2 by
+        // removing the objects migration 0003 adds. This is what an existing user's vault on
+        // disk actually looks like right before they upgrade to a build carrying 0003.
         let mut vault = Vault::create_new(&path, &vault_key).expect("create");
-        let conversation_id = schema::insert_conversation(
-            &mut vault,
-            &ConversationRecord {
-                local_alias: "pre-migration-contact".into(),
-            },
-        )
-        .expect("insert conversation");
-        schema::insert_message(
-            &mut vault,
-            &MessageRecord {
-                conversation_id: conversation_id.clone(),
-                ciphertext: b"pre-migration ciphertext".to_vec(),
-            },
-        )
-        .expect("insert message");
+        let conversation_id = vault
+            .insert_conversation("pre-migration-contact")
+            .expect("insert conversation");
+        vault
+            .insert_outgoing_message(&conversation_id, b"pre-migration ciphertext")
+            .expect("insert message");
         vault
             .connection_mut()
             .execute_batch(
-                "DROP INDEX attachments_message_id_idx; \
-                 DROP INDEX invitations_resulting_contact_id_idx;",
+                "DROP INDEX contacts_external_id_idx; \
+                 ALTER TABLE contacts DROP COLUMN external_id;",
             )
-            .expect("drop 0002 objects");
+            .expect("drop 0003 objects");
         vault
             .connection_mut()
-            .pragma_update(None, "user_version", 1)
-            .expect("roll back to schema version 1");
+            .pragma_update(None, "user_version", 2)
+            .expect("roll back to schema version 2");
         drop(vault);
 
-        // Reopening must run migration 0002 forward and must not touch the data already
-        // inserted at version 1.
+        // Reopening must run migration 0003 forward and must not touch the data already
+        // inserted at version 2.
         let vault = Vault::open_existing(&path, &vault_key).expect("reopen and migrate forward");
         assert_eq!(vault.schema_version().expect("version"), SCHEMA_VERSION);
 
@@ -412,6 +463,30 @@ mod tests {
             )
             .expect("message inserted before migration must survive it");
         assert_eq!(preserved_message_count, 1);
+    }
+
+    #[test]
+    fn conversation_for_protocol_contact_reuses_existing_conversation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.db");
+        let vault_key = key();
+        let mut vault = Vault::create_new(&path, &vault_key).expect("create");
+
+        let first = vault
+            .conversation_for_protocol_contact(42, "bob")
+            .expect("first resolution creates the conversation");
+        let second = vault
+            .conversation_for_protocol_contact(42, "bob")
+            .expect("second resolution finds the same conversation");
+        assert_eq!(
+            first, second,
+            "repeat events for one contact must not fork conversations"
+        );
+
+        let other = vault
+            .conversation_for_protocol_contact(7, "carol")
+            .expect("a different contact id gets its own conversation");
+        assert_ne!(first, other);
     }
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {

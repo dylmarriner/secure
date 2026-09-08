@@ -24,6 +24,9 @@ use super::commands::{self, ChatKind};
 pub enum AdapterError {
     #[error(transparent)]
     Client(#[from] ClientError),
+    #[cfg(feature = "simplex-native")]
+    #[error(transparent)]
+    Core(#[from] super::core::CoreError),
     #[error("simplex-chat rejected the command: {0}")]
     CommandFailed(serde_json::Value),
     #[error("unexpected response shape from simplex-chat: {0}")]
@@ -178,11 +181,14 @@ impl SimplexAdapter {
     }
 }
 
-fn is_error_response(response: &serde_json::Value) -> bool {
-    response.get("type").and_then(serde_json::Value::as_str) == Some("chatCmdError")
+pub(super) fn is_error_response(response: &serde_json::Value) -> bool {
+    matches!(
+        response.get("type").and_then(serde_json::Value::as_str),
+        Some("chatCmdError" | "error")
+    )
 }
 
-fn extract_user_id(response: &serde_json::Value) -> Result<i64, AdapterError> {
+pub(super) fn extract_user_id(response: &serde_json::Value) -> Result<i64, AdapterError> {
     response
         .get("user")
         .and_then(|user| user.get("userId"))
@@ -194,7 +200,7 @@ fn extract_user_id(response: &serde_json::Value) -> Result<i64, AdapterError> {
 /// `APIGetNetworkConfig` response. `None` if the field is absent/not a string, which
 /// [`SimplexAdapter::configure_network`] treats the same as any other mismatch - fail closed,
 /// not "assume no proxy is fine".
-fn extract_socks_proxy(response: &serde_json::Value) -> Option<String> {
+pub(super) fn extract_socks_proxy(response: &serde_json::Value) -> Option<String> {
     response
         .get("networkConfig")?
         .get("socksProxy")?
@@ -202,7 +208,9 @@ fn extract_socks_proxy(response: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn extract_invitation_link(response: &serde_json::Value) -> Result<String, AdapterError> {
+pub(super) fn extract_invitation_link(
+    response: &serde_json::Value,
+) -> Result<String, AdapterError> {
     response
         .get("connLinkInvitation")
         .and_then(|link| link.get("connFullLink"))
@@ -220,6 +228,15 @@ mod tests {
         let response = serde_json::json!({
             "type": "chatCmdError",
             "chatError": {"type": "error", "errorType": {"type": "noActiveUser"}}
+        });
+        assert!(is_error_response(&response));
+    }
+
+    #[test]
+    fn recognises_a_native_core_error_response() {
+        let response = serde_json::json!({
+            "type": "error",
+            "error": {"errorType": {"type": "noActiveUser"}}
         });
         assert!(is_error_response(&response));
     }

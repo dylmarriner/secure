@@ -27,4 +27,6 @@ pub(crate) mod commands;
 #[cfg(feature = "simplex-native")]
 pub(crate) mod core;
 pub(crate) mod events;
+#[cfg(feature = "simplex-native")]
+pub(crate) mod native_adapter;
 pub(crate) mod protocol;

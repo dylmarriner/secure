@@ -24,6 +24,7 @@ const VAULT_KEY_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 const CIPHERTEXT_LEN: usize = VAULT_KEY_LEN + TAG_LEN;
 const FIXED_HEADER_LEN: usize = 4 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN + 4;
+const RECORD_NONCE_LEN: usize = 24;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CryptoError {
@@ -41,6 +42,10 @@ pub enum CryptoError {
     InvalidEnvelope,
     #[error("subkey derivation failed")]
     SubkeyDerivationFailed,
+    #[error("messaging-record encryption failed")]
+    RecordEncryptionFailed,
+    #[error("messaging-record authentication failed")]
+    RecordAuthenticationFailed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,6 +149,9 @@ pub enum SubkeyPurpose {
     /// `DatabaseV1` (Secure's own SQLCipher vault) so a compromise or reuse of one key can never
     /// unlock the other, even though both derive from the same `VaultKey`.
     MessagingDatabaseV1,
+    /// Key for application-level message-record encryption, separate from the native SimpleX
+    /// database key and Secure's own SQLCipher key.
+    MessagingRecordV1,
 }
 
 impl SubkeyPurpose {
@@ -152,8 +160,74 @@ impl SubkeyPurpose {
             Self::DatabaseV1 => b"database-v1",
             Self::LocalConfigV1 => b"local-config-v1",
             Self::MessagingDatabaseV1 => b"messaging-database-v1",
+            Self::MessagingRecordV1 => b"messaging-record-v1",
         }
     }
+}
+
+/// Encrypt one message record for storage. The returned bytes are `nonce || ciphertext`; the
+/// conversation id and direction are authenticated as metadata so ciphertext cannot be moved
+/// between conversations or incoming/outgoing columns without detection.
+pub fn seal_messaging_record(
+    key: &VaultKey,
+    conversation_id: &str,
+    direction: &str,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let subkey = key.derive_subkey(SubkeyPurpose::MessagingRecordV1)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&*subkey)
+        .map_err(|_| CryptoError::RecordEncryptionFailed)?;
+    let mut nonce = [0_u8; RECORD_NONCE_LEN];
+    OsRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| CryptoError::RandomnessUnavailable)?;
+    let aad = messaging_record_aad(conversation_id, direction);
+    let encrypted = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
+        .map_err(|_| CryptoError::RecordEncryptionFailed)?;
+    let mut output = Vec::with_capacity(RECORD_NONCE_LEN + encrypted.len());
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(&encrypted);
+    Ok(output)
+}
+
+/// Decrypt a message record previously returned by [`seal_messaging_record`].
+pub fn open_messaging_record(
+    key: &VaultKey,
+    conversation_id: &str,
+    direction: &str,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, CryptoError> {
+    let (nonce, encrypted) = ciphertext
+        .split_at_checked(RECORD_NONCE_LEN)
+        .ok_or(CryptoError::RecordAuthenticationFailed)?;
+    let subkey = key.derive_subkey(SubkeyPurpose::MessagingRecordV1)?;
+    let cipher = XChaCha20Poly1305::new_from_slice(&*subkey)
+        .map_err(|_| CryptoError::RecordAuthenticationFailed)?;
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: encrypted,
+                aad: &messaging_record_aad(conversation_id, direction),
+            },
+        )
+        .map_err(|_| CryptoError::RecordAuthenticationFailed)
+}
+
+fn messaging_record_aad(conversation_id: &str, direction: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(8 + conversation_id.len() + direction.len());
+    aad.extend_from_slice(&(conversation_id.len() as u32).to_be_bytes());
+    aad.extend_from_slice(conversation_id.as_bytes());
+    aad.extend_from_slice(&(direction.len() as u32).to_be_bytes());
+    aad.extend_from_slice(direction.as_bytes());
+    aad
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

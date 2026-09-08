@@ -27,7 +27,9 @@ SIMPLEX_CHAT_COMMIT=4df04bdb3ff94059734ad2da7d2766de6dba2cc7
 SIMPLEX_CHAT_VERSION=7.0.0.12
 GHC_VERSION=9.6.3
 
-output_dir="$(cd "$(dirname "${1:-./target/simplex-native}")" 2>/dev/null && pwd || mkdir -p "${1:-./target/simplex-native}" && cd "${1:-./target/simplex-native}" && pwd)"
+target_dir="${1:-./target/simplex-native}"
+mkdir -p "$target_dir"
+output_dir="$(cd "$target_dir" && pwd)"
 work_dir="$(mktemp -d)"
 trap 'rm -rf "$work_dir"' EXIT
 
