@@ -81,7 +81,20 @@ async fn bootstraps_and_connects_over_the_real_tor_network() {
     assert_eq!(response[0], 5);
     assert_eq!(response[1], 0, "SOCKS proxy must open the stream over Tor");
 
+    let proxy_address = proxy.address();
     proxy.shutdown().await;
 
+    // R2 exit criterion: a proxied stream works before stop and is unusable after stop. The
+    // listener task exits on shutdown, so a fresh connection attempt to the same loopback
+    // address must be refused rather than silently reused or left half-open.
+    TcpStream::connect(proxy_address)
+        .await
+        .expect_err("SOCKS proxy must refuse new connections once shut down");
+
     transport.stop().expect("stop");
+
+    transport
+        .connect("check.torproject.org", 443)
+        .await
+        .expect_err("Tor transport must refuse new streams once stopped");
 }

@@ -198,19 +198,21 @@ No destructive action occurs before a durable burn marker exists, and every cras
       installed - rather than mocking Arti's bootstrap future, since this crate has no seam to
       inject one without a larger refactor).
 - [x] `stop_broadcasts_shutdown_to_socks_proxy_subscribers` proves the transport-to-proxy signal
-      path itself (no live Tor needed). A true `stop_aborts_existing_socks_streams` with a real
-      proxied byte stream needs a live/ignored Tor test like `live_bootstrap.rs`'s, matching this
-      crate's existing testing split (pure logic unit-tested, real Arti I/O covered by
-      `#[ignore]`d live tests) - not yet written; tracked as a follow-up alongside the other R4
-      live two-client work.
+      path itself (no live Tor needed). `stop_aborts_existing_socks_streams` with a real proxied
+      byte stream is now covered by the live/ignored `bootstraps_and_connects_over_the_real_tor_network`
+      test in `live_bootstrap.rs` (see below) rather than a separate test, matching this crate's
+      existing testing split (pure logic unit-tested, real Arti I/O covered by `#[ignore]`d live
+      tests).
 - [x] `socks_listener_refuses_after_stop` - already covered pre-R2 by
       `socks_proxy_before_start_refuses_without_binding_a_port` (`start_socks_proxy` refuses
       before `Ready`) and `ready_client`'s lifecycle check, which every accepted SOCKS `CONNECT`
       re-runs regardless of when `stop` happens.
 - [x] `no_client_is_installed_after_stopped_state` - covered by
       `stop_wins_against_late_bootstrap_completion`.
-- [ ] live Tor test confirms a proxied stream works before stop and is unusable after stop.
-      (Same live-test follow-up as above.)
+- [x] live Tor test confirms a proxied stream works before stop and is unusable after stop.
+      (`crates/secure-transport/tests/live_bootstrap.rs`, run against the real Tor network:
+      connects through the SOCKS proxy, shuts it down, asserts a fresh connect to the same
+      loopback address is refused, then asserts `transport.connect` is refused after `stop()`.)
 
 ## Verification
 
