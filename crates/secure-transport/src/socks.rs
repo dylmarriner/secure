@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use arti_client::TorClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 use tokio::task::{JoinHandle, JoinSet};
 use tor_rtcompat::PreferredRuntime;
 use tor_socksproto::{
@@ -16,12 +17,17 @@ use crate::{TransportError, ready_client};
 
 /// A loopback-only SOCKS5 bridge into a ready [`crate::TorTransport`].
 ///
-/// Dropping or explicitly shutting down this handle aborts the listener and every connection
-/// it accepted. The bound address is safe to pass to a local subprocess; the listener never
-/// binds a non-loopback interface.
+/// Dropping or explicitly shutting down this handle - or the owning [`crate::TorTransport`]
+/// calling [`crate::TorTransport::stop`] - stops the listener and cancels every connection it
+/// accepted, including one currently mid-transfer. That cancellation is cooperative (a shared
+/// `watch` signal raced against `copy_bidirectional`), not a hard socket-level kill, but it
+/// closes both sides of the proxied connection as soon as the in-flight copy notices the
+/// signal, without waiting for the remote peer. The bound address is safe to pass to a local
+/// subprocess; the listener never binds a non-loopback interface.
 pub struct TorSocksProxy {
     address: SocketAddr,
     task: JoinHandle<()>,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for TorSocksProxy {
@@ -38,6 +44,7 @@ impl TorSocksProxy {
     pub(crate) async fn start(
         lifecycle: Arc<Mutex<TransportLifecycle>>,
         client: Arc<Mutex<Option<Arc<TorClient<PreferredRuntime>>>>>,
+        transport_shutdown: watch::Receiver<bool>,
     ) -> Result<Self, TransportError> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -46,18 +53,50 @@ impl TorSocksProxy {
             .local_addr()
             .map_err(TransportError::SocksAddress)?;
 
+        let (shutdown_tx, proxy_shutdown) = watch::channel(false);
+
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
-            while let Ok((socket, _peer)) = listener.accept().await {
-                let lifecycle = Arc::clone(&lifecycle);
-                let client = Arc::clone(&client);
-                connections.spawn(async move {
-                    let _ = serve(socket, &lifecycle, &client).await;
-                });
+            let mut proxy_shutdown = proxy_shutdown;
+            let mut transport_shutdown = transport_shutdown;
+
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let Ok((socket, _peer)) = accepted else { break; };
+                        let lifecycle = Arc::clone(&lifecycle);
+                        let client = Arc::clone(&client);
+                        let conn_proxy_shutdown = proxy_shutdown.clone();
+                        let conn_transport_shutdown = transport_shutdown.clone();
+                        connections.spawn(async move {
+                            let mut conn_proxy_shutdown = conn_proxy_shutdown;
+                            let mut conn_transport_shutdown = conn_transport_shutdown;
+                            let _ = serve(
+                                socket,
+                                &lifecycle,
+                                &client,
+                                &mut conn_proxy_shutdown,
+                                &mut conn_transport_shutdown,
+                            )
+                            .await;
+                        });
+                    }
+                    _ = wait_for_shutdown(&mut proxy_shutdown) => break,
+                    _ = wait_for_shutdown(&mut transport_shutdown) => break,
+                }
             }
+
+            // Stop accepting new connections, then wait for every in-flight connection to
+            // observe the same shutdown signal and exit before this task itself finishes -
+            // this is what makes `shutdown`/`stop` awaitable rather than fire-and-forget.
+            while connections.join_next().await.is_some() {}
         });
 
-        Ok(Self { address, task })
+        Ok(Self {
+            address,
+            task,
+            shutdown_tx,
+        })
     }
 
     /// The IPv4 loopback address on which this proxy is listening.
@@ -66,16 +105,31 @@ impl TorSocksProxy {
         self.address
     }
 
-    /// Stop accepting connections and abort every connection currently being proxied.
+    /// Stop accepting connections, cancel every connection currently being proxied, and wait
+    /// for the listener and all forwarding tasks to actually terminate before returning.
     pub async fn shutdown(mut self) {
-        self.task.abort();
+        let _ = self.shutdown_tx.send(true);
         let _ = (&mut self.task).await;
     }
 }
 
 impl Drop for TorSocksProxy {
     fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
         self.task.abort();
+    }
+}
+
+/// Resolves once `rx` carries (or ever changes to) `true`. Checks the current value first so a
+/// receiver subscribed after the flip does not miss it by waiting on `changed()` alone.
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
     }
 }
 
@@ -83,6 +137,8 @@ async fn serve(
     mut socket: TcpStream,
     lifecycle: &Mutex<TransportLifecycle>,
     client: &Mutex<Option<Arc<TorClient<PreferredRuntime>>>>,
+    proxy_shutdown: &mut watch::Receiver<bool>,
+    transport_shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let request = read_request(&mut socket).await?;
 
@@ -126,7 +182,15 @@ async fn serve(
     socket
         .write_all(&request.reply(SocksStatus::SUCCEEDED, None)?)
         .await?;
-    tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
+
+    // A shutdown signal wins the race against an in-progress transfer: dropping the
+    // `copy_bidirectional` future here drops and closes both `socket` and `stream`, so neither
+    // side of an already-proxied connection survives past `stop`/`shutdown`.
+    tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut socket, &mut stream) => { result?; }
+        () = wait_for_shutdown(proxy_shutdown) => {}
+        () = wait_for_shutdown(transport_shutdown) => {}
+    }
     Ok(())
 }
 

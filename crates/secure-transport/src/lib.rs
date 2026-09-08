@@ -73,6 +73,11 @@ pub struct TorTransport {
     lifecycle: Arc<Mutex<lifecycle::TransportLifecycle>>,
     client: Arc<Mutex<Option<Arc<TorClient<PreferredRuntime>>>>>,
     config: TorClientConfig,
+    /// Broadcasts `true` exactly once, from [`Self::stop`]. Every [`TorSocksProxy`] started
+    /// from this transport subscribes to a clone of the receiver side, so stopping the
+    /// transport cancels its active proxied streams too, not only future `connect`/SOCKS
+    /// attempts - see `socks::wait_for_shutdown`.
+    shutdown: tokio::sync::watch::Sender<bool>,
 }
 
 /// `rustls` 0.23+ requires a process-wide `CryptoProvider` to be installed before any TLS
@@ -108,10 +113,12 @@ impl TorTransport {
             .build()
             .map_err(|error| TransportError::Configuration(error.to_string()))?;
 
+        let (shutdown, _receiver) = tokio::sync::watch::channel(false);
         Ok(Self {
             lifecycle: Arc::new(Mutex::new(lifecycle::TransportLifecycle::new())),
             client: Arc::new(Mutex::new(None)),
             config,
+            shutdown,
         })
     }
 
@@ -136,8 +143,16 @@ impl TorTransport {
 
         match TorClient::create_bootstrapped(self.config.clone()).await {
             Ok(client) => {
+                // A concurrent `stop()` may have already moved the lifecycle out of
+                // `Bootstrapping` (e.g. to `Stopped`) while this bootstrap was in flight. Install
+                // the client only if the transition to `Ready` actually succeeds; otherwise stop
+                // won the race and this freshly-bootstrapped client must be discarded rather than
+                // left installed under a lifecycle that no longer says `Ready`.
                 self.set_client(Some(client));
-                self.apply(TransportEvent::BootstrapSucceeded)?;
+                if let Err(error) = self.apply(TransportEvent::BootstrapSucceeded) {
+                    self.set_client(None);
+                    return Err(error);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -175,7 +190,12 @@ impl TorTransport {
     /// the proxy refuse subsequent connections.
     pub async fn start_socks_proxy(&self) -> Result<TorSocksProxy, TransportError> {
         ready_client(&self.lifecycle, &self.client)?;
-        TorSocksProxy::start(Arc::clone(&self.lifecycle), Arc::clone(&self.client)).await
+        TorSocksProxy::start(
+            Arc::clone(&self.lifecycle),
+            Arc::clone(&self.client),
+            self.shutdown.subscribe(),
+        )
+        .await
     }
 
     /// The current bootstrap progress, if a bootstrap has ever been attempted: `0.0` (just
@@ -192,11 +212,22 @@ impl TorTransport {
     /// synchronously inside the lifecycle's `Mutex`, before this function returns, regardless
     /// of what Arti's own background tasks are still doing. This is the property that matters
     /// for shutdown sequencing ahead of lock/burn cleanup: no *new* network activity can start
-    /// once `stop` has returned. `Stopped` is terminal; a new `TorTransport` must be
-    /// constructed to use Tor again.
+    /// once `stop` has returned. `stop` also broadcasts on this transport's shutdown watch, so
+    /// every [`TorSocksProxy`] started from it cancels its already-accepted connections too, not
+    /// only future ones. `Stopped` is terminal; a new `TorTransport` must be constructed to use
+    /// Tor again.
+    ///
+    /// What this does **not** guarantee: `stop` drops this crate's only `Arc<TorClient>` handle,
+    /// it does not call any Arti shutdown/dormant API on the client. Arti's own directory/guard
+    /// management and any circuits it already built are not proven to stop producing network
+    /// traffic the instant this returns - "no new Secure-initiated stream", not "zero Tor
+    /// process network traffic". See the R2 section of `docs/security-remediation-plan.md`.
     pub fn stop(&self) -> Result<(), TransportError> {
         self.apply(TransportEvent::Stop)?;
         self.set_client(None);
+        // Best-effort: an error here only means no `TorSocksProxy` ever subscribed, i.e. there
+        // is nothing live left to cancel.
+        let _ = self.shutdown.send(true);
         Ok(())
     }
 
@@ -282,6 +313,99 @@ mod tests {
                 state: TransportState::NotStarted
             }
         ));
+    }
+
+    #[test]
+    fn stop_wins_against_late_bootstrap_completion() {
+        // Simulates the race without a real Arti bootstrap: `Start` moves the lifecycle to
+        // `Bootstrapping`, `Stop` (racing in from another task) moves it to `Stopped` before the
+        // bootstrap's `BootstrapSucceeded` is applied, so the late completion must be rejected
+        // and no client may end up installed under a `Stopped` lifecycle.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = TorTransport::new(&dir.path().join("state"), &dir.path().join("cache"))
+            .expect("build transport config");
+
+        transport.apply(TransportEvent::Start).expect("start");
+        transport.stop().expect("stop wins the race");
+        assert_eq!(transport.state(), TransportState::Stopped);
+
+        let late_completion = transport.apply(TransportEvent::BootstrapSucceeded);
+        assert!(
+            late_completion.is_err(),
+            "a bootstrap that finishes after stop must not resurrect Ready"
+        );
+        assert_eq!(transport.state(), TransportState::Stopped);
+        assert!(
+            transport.client.lock().unwrap().is_none(),
+            "no client may be installed once stop has won"
+        );
+    }
+
+    #[test]
+    fn stop_broadcasts_shutdown_to_socks_proxy_subscribers() {
+        // `TorSocksProxy` cancels active connections by subscribing to this same watch channel
+        // (see `socks::wait_for_shutdown`); this asserts the transport side of that contract
+        // without needing a real listener or a live Tor bootstrap.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = TorTransport::new(&dir.path().join("state"), &dir.path().join("cache"))
+            .expect("build transport config");
+
+        let mut subscriber = transport.shutdown.subscribe();
+        assert!(!*subscriber.borrow(), "must not be pre-signalled");
+
+        transport.stop().expect("stop");
+
+        assert!(
+            *subscriber.borrow_and_update(),
+            "stop must flip the shared shutdown watch"
+        );
+    }
+
+    #[test]
+    fn lifecycle_and_client_locks_never_deadlock_under_concurrent_start_stop() {
+        // `ready_client` locks `lifecycle` then (while still holding it) `client`; `apply` and
+        // `set_client` each lock exactly one of the two independently. That is one fixed lock
+        // order (lifecycle before client, never the reverse), so hammering start/stop/connect
+        // concurrently from many threads must finish promptly rather than deadlock.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = Arc::new(
+            TorTransport::new(&dir.path().join("state"), &dir.path().join("cache"))
+                .expect("build transport config"),
+        );
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let transport = Arc::clone(&transport);
+                std::thread::spawn(move || {
+                    for _ in 0..200 {
+                        if i % 2 == 0 {
+                            let _ = transport.apply(TransportEvent::Start);
+                        } else {
+                            let _ = transport.stop();
+                        }
+                        let _ = transport.state();
+                    }
+                })
+            })
+            .collect();
+
+        // A `join` on every thread returning within a generous bound is the deadlock check
+        // itself: a real lock-order violation here would hang this test, not fail an assertion.
+        runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                for handle in handles {
+                    tokio::task::spawn_blocking(move || handle.join())
+                        .await
+                        .expect("join task")
+                        .expect("worker thread must not panic");
+                }
+            })
+            .await
+            .expect("start/stop contention must not deadlock");
+        });
+
+        assert_eq!(transport.state(), TransportState::Stopped);
     }
 
     #[tokio::test]

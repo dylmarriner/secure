@@ -15,7 +15,7 @@ arti-client = { version = "0.46", default-features = false, features = ["tokio",
 # recorded there.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 thiserror.workspace = true
-tokio = { version = "1", features = ["io-util", "net", "rt", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
 tor-socksproto = "0.46"
 tor-rtcompat = { version = "0.46", features = ["tokio", "rustls"] }
 

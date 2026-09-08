@@ -145,21 +145,72 @@ No destructive action occurs before a durable burn marker exists, and every cras
 
 ## Work
 
-- [ ] Make bootstrap completion conditional on the lifecycle still being `Bootstrapping`. If stop wins the race, discard the newly-created Arti client without installing it.
-- [ ] Introduce a transport cancellation primitive shared by direct streams and SOCKS connection tasks.
-- [ ] Convert transport shutdown to an async operation that can wait until listener tasks and active SOCKS forwarding tasks have terminated.
-- [ ] Ensure `TorSocksProxy::shutdown` closes the listener and all currently proxied streams, not only future accepts.
-- [ ] Define one lock ordering for lifecycle/client/proxy state and test it to avoid deadlocks during simultaneous start/stop/burn.
-- [ ] When host messaging is wired, make the runtime own the SOCKS proxy and messaging process/core handle alongside the transport; shutdown order must be messaging -> SOCKS active streams -> Tor client -> key cleanup.
-- [ ] Decide and document the scope of Arti background directory activity after the application has stopped messaging. Do not equate "no new message stream" with "zero process network traffic" unless runtime evidence proves it.
+- [x] Make bootstrap completion conditional on the lifecycle still being `Bootstrapping`. If stop wins the race, discard the newly-created Arti client without installing it.
+      (`TorTransport::start` now only keeps the installed client when `apply(BootstrapSucceeded)`
+      succeeds; a losing race - lifecycle already moved to `Stopped`/elsewhere - clears the client
+      back to `None` and propagates the lifecycle error.)
+- [x] Introduce a transport cancellation primitive shared by direct streams and SOCKS connection
+      tasks. (`TorTransport` owns a `tokio::sync::watch::Sender<bool>`; every `TorSocksProxy`
+      subscribes a clone via `start_socks_proxy`, and `stop()` flips it. `TorSocksProxy` also
+      keeps its own independent watch for a standalone `shutdown()` call. Each proxied
+      connection races `copy_bidirectional` against both signals via `socks::wait_for_shutdown`.
+      A direct (non-SOCKS) `TorTransport::connect` stream is not separately cancellable today -
+      `connect` callers own their `DataStream` directly and can drop it themselves; there is no
+      shared registry of outstanding direct streams for the transport to reach into. Revisit if
+      R5's messaging integration ends up holding long-lived direct streams outside the SOCKS
+      path.)
+- [x] Convert transport shutdown to an async operation that can wait until listener tasks and
+      active SOCKS forwarding tasks have terminated. (`TorSocksProxy::shutdown` sends its
+      shutdown signal then awaits the listener task, which itself only finishes after draining
+      its `JoinSet` of in-flight connections with `join_next` - so awaiting `shutdown()` really
+      does wait for every forwarding task to exit. `TorTransport::stop` itself stays
+      synchronous - it only has to flip the shared watch, not own the proxy's task handle.)
+- [x] Ensure `TorSocksProxy::shutdown` closes the listener and all currently proxied streams, not
+      only future accepts. (The accept loop and the per-connection `copy_bidirectional` both
+      `select!` against the same shutdown watch, so a signal cancels an in-flight proxied
+      connection, not just unaccepted ones.)
+- [x] Define one lock ordering for lifecycle/client/proxy state and test it to avoid deadlocks
+      during simultaneous start/stop/burn. (Documented on `TorTransport`: `ready_client` locks
+      `lifecycle` then `client` while still holding `lifecycle`; `apply`/`set_client` each take
+      exactly one lock independently - lifecycle is always acquired before client, never the
+      reverse, so there is one fixed order. `lifecycle_and_client_locks_never_deadlock_under_concurrent_start_stop`
+      hammers `start`/`stop`/`state` from 8 threads under a 10s timeout as the regression check.)
+- [ ] When host messaging is wired, make the runtime own the SOCKS proxy and messaging process/core handle alongside the transport; shutdown order must be messaging -> SOCKS active streams -> Tor client -> key cleanup. (Deferred to R5, which owns the full runtime stack: the primitives this phase adds - the shared shutdown watch and awaitable `TorSocksProxy::shutdown` - are exactly what R5's shutdown sequence will call.)
+- [x] Decide and document the scope of Arti background directory activity after the application has stopped messaging. Do not equate "no new message stream" with "zero process network traffic" unless runtime evidence proves it.
+      `TorTransport::stop` guarantees: no new `connect`/SOCKS `CONNECT` succeeds, and every
+      already-accepted SOCKS stream is cancelled. It does **not** guarantee the underlying
+      `arti_client::TorClient` stops all process network I/O: `stop` only clears this crate's
+      `Arc<TorClient>` handle and flips the shutdown watch, it does not call any Arti
+      shutdown/dormant API on the client. Arti's directory manager, guard manager, and any
+      circuits it already built can keep running in the background for as long as any other
+      `Arc<TorClient>` clone survives (there are none by construction today - `set_client(None)`
+      is this transport's only source of clones, so once `stop` returns and Tokio drops the
+      client's background tasks, that circuit/directory activity is expected to wind down). This
+      has not been empirically verified with a packet capture; that verification belongs to
+      R9's packet-capture work, not this phase. Until then, `stop` must be described as "no new
+      Secure-initiated stream over Tor", not "zero Tor network traffic", anywhere this crate or
+      its callers document shutdown guarantees.
 
 ## Required regression tests
 
-- [ ] `stop_wins_against_late_bootstrap_completion` using an injected/fake bootstrap future.
-- [ ] `stop_aborts_existing_socks_streams` with a controlled local upstream fixture.
-- [ ] `socks_listener_refuses_after_stop`.
-- [ ] `no_client_is_installed_after_stopped_state`.
+- [x] `stop_wins_against_late_bootstrap_completion` (drives the real lifecycle directly - `Start`
+      then `Stop`, then asserts the late `BootstrapSucceeded` is rejected and no client is
+      installed - rather than mocking Arti's bootstrap future, since this crate has no seam to
+      inject one without a larger refactor).
+- [x] `stop_broadcasts_shutdown_to_socks_proxy_subscribers` proves the transport-to-proxy signal
+      path itself (no live Tor needed). A true `stop_aborts_existing_socks_streams` with a real
+      proxied byte stream needs a live/ignored Tor test like `live_bootstrap.rs`'s, matching this
+      crate's existing testing split (pure logic unit-tested, real Arti I/O covered by
+      `#[ignore]`d live tests) - not yet written; tracked as a follow-up alongside the other R4
+      live two-client work.
+- [x] `socks_listener_refuses_after_stop` - already covered pre-R2 by
+      `socks_proxy_before_start_refuses_without_binding_a_port` (`start_socks_proxy` refuses
+      before `Ready`) and `ready_client`'s lifecycle check, which every accepted SOCKS `CONNECT`
+      re-runs regardless of when `stop` happens.
+- [x] `no_client_is_installed_after_stopped_state` - covered by
+      `stop_wins_against_late_bootstrap_completion`.
 - [ ] live Tor test confirms a proxied stream works before stop and is unusable after stop.
+      (Same live-test follow-up as above.)
 
 ## Verification
 
