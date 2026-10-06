@@ -16,7 +16,7 @@ rust-version = "1.85"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
-argon2 = "0.5.3"
+argon2 = "0.6.0"
 chacha20poly1305 = "0.10.1"
 hkdf = "0.12.4"
 rand_core = { version = "0.6.4", features = ["getrandom"] }
