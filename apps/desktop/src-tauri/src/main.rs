@@ -198,9 +198,15 @@ fn main() {
             fs::create_dir_all(&tor_state_dir).expect("failed to create the Tor state directory");
             fs::create_dir_all(&tor_cache_dir).expect("failed to create the Tor cache directory");
 
-            let runtime =
-                AppRuntime::new(VaultPaths::new(app_data_dir), tor_state_dir, tor_cache_dir)
-                    .expect("failed to construct application runtime");
+            let runtime = AppRuntime::new(
+                VaultPaths::new(app_data_dir),
+                tor_state_dir,
+                tor_cache_dir,
+                // TPM 2.0 where supported; otherwise a store that refuses every operation, so
+                // no production identity is ever created without device-bound protection.
+                std::sync::Arc::from(secure_device::platform_store()),
+            )
+            .expect("failed to construct application runtime");
             app.manage(runtime);
             Ok(())
         })

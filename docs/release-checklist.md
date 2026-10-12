@@ -9,6 +9,7 @@ operational form of `docs/security-remediation-plan.md` Phase R9's production ex
 
 - [ ] `CI` workflow: `Rust core (ubuntu-latest)`, `Rust core (windows-latest)`,
       `Tauri desktop tests (Linux)`, `Tauri desktop tests (Windows)`,
+      `TPM 2.0 device-secret backend (swtpm)`,
       `Supply chain (cargo-deny, SBOM, release metadata)`, and
       `Security remediation gate (docs/security-remediation-plan.md)`.
 - [ ] `Integration security (live Tor)` workflow run on the release commit (manual dispatch).
@@ -22,7 +23,7 @@ operational form of `docs/security-remediation-plan.md` Phase R9's production ex
 
 - [ ] `main` protected by a ruleset: no direct pushes, no force pushes, pull request required,
       at least one approving review.
-- [ ] All six `CI` checks in section 1 marked as **required** status checks.
+- [ ] All seven `CI` checks in section 1 marked as **required** status checks.
 - [ ] GitHub Actions billing/spending limit healthy - CI that cannot start is treated as red.
 
 ## 3. Evidence that needs real infrastructure (cannot be produced by unit tests)
@@ -43,14 +44,17 @@ operational form of `docs/security-remediation-plan.md` Phase R9's production ex
 - [ ] Arti's documented `process::exit(1)` obsolete-client behaviour reviewed for the shipped
       Arti version and dispositioned (R9).
 
-## 4. Product invariants that are not implemented yet
+## 4. Device-bound anti-rollback and Burn replacement
 
-- [ ] Device-bound destruction / anti-rollback state (`docs/backup-snapshot-hardening.md`):
-      restoring a pre-burn copy of the application-data directory must not restore a burned
-      identity. Until this exists, the "restoring old state does not restore a burned identity"
-      claim must not be made.
-- [ ] Mandatory automatic replacement identity after Burn (`docs/self-destruct-semantics.md`),
-      including the cases where the user did not supply a new passphrase.
+- [x] Device-bound destruction secret (`docs/backup-snapshot-hardening.md`) on Linux: TPM 2.0 NV
+      index, destroyed by Burn; `restoring_a_pre_burn_copy_cannot_resurrect_the_burned_identity`
+      passes and the TPM path is tested against swtpm in CI.
+- [ ] The same on Windows (TPM via TBS/NCrypt). Until then Windows builds fail closed and must not
+      be released as supported.
+- [ ] Verified on real TPM hardware (not only swtpm) on each supported Linux target, including
+      `/dev/tpmrm0` permissions and a TPM whose owner authorization is set (must fail closed).
+- [x] After Burn, Secure returns to fresh provisioning, or straight to the replacement identity
+      when one was supplied (`docs/self-destruct-semantics.md`).
 
 ## 5. Independent review
 

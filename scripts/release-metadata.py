@@ -15,7 +15,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "apps" / "desktop" / "src-tauri" / "Cargo.toml"
-TRACKED = ("arti-client", "tor-proto", "rusqlite", "libsqlite3-sys", "rustls", "tauri", "chacha20poly1305", "argon2")
+TRACKED = ("arti-client", "tor-proto", "rusqlite", "libsqlite3-sys", "rustls", "tauri", "chacha20poly1305", "argon2", "hkdf", "tss-esapi")
 
 
 def cargo_metadata():

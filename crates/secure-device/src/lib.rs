@@ -23,7 +23,7 @@
 
 #[cfg(feature = "test-store")]
 pub mod memory;
-#[cfg(feature = "tpm")]
+#[cfg(all(feature = "tpm", target_os = "linux"))]
 pub mod tpm;
 
 use std::fmt;
@@ -159,6 +159,7 @@ impl DeviceSecretStore for UnavailableStore {
     }
 }
 
+#[cfg(any(feature = "test-store", all(feature = "tpm", target_os = "linux")))]
 pub(crate) fn random_secret() -> Result<DeviceSecret, DeviceError> {
     use rand_core::{OsRng, RngCore};
     let mut secret = Zeroizing::new([0_u8; SECRET_LEN]);
@@ -172,14 +173,14 @@ pub(crate) fn random_secret() -> Result<DeviceSecret, DeviceError> {
 /// [`UnavailableStore`] (which makes identity provisioning fail closed).
 #[must_use]
 pub fn platform_store() -> Box<dyn DeviceSecretStore> {
-    #[cfg(feature = "tpm")]
+    #[cfg(all(feature = "tpm", target_os = "linux"))]
     {
         match tpm::TpmNvStore::from_environment() {
             Ok(store) => Box::new(store),
             Err(error) => Box::new(UnavailableStore::new(error.to_string())),
         }
     }
-    #[cfg(not(feature = "tpm"))]
+    #[cfg(not(all(feature = "tpm", target_os = "linux")))]
     {
         Box::new(UnavailableStore::new(
             "this build has no device-bound key backend for this platform",

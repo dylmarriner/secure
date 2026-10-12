@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use rand_core::{OsRng, RngCore};
 use secure_attachments::store::AttachmentStore;
 use secure_core::{AppEvent, AppLifecycle, AppState, DestructionEvent, DestructionStage};
-use secure_crypto::{Argon2Profile, VaultKey, VaultKeyEnvelope};
+use secure_crypto::{Argon2Profile, CryptoError, VaultKey, VaultKeyEnvelope};
+use secure_device::{DeviceError, DeviceLocator, DeviceSecretStore};
 use secure_storage::Vault;
 use secure_transport::{TorTransport, TransportState};
 use serde::Serialize;
@@ -28,6 +29,7 @@ const ENVELOPE_FILE_NAME: &str = "vault.key";
 const DATABASE_FILE_NAME: &str = "vault.db";
 const ATTEMPTS_FILE_NAME: &str = "vault.attempts";
 const BURN_JOURNAL_FILE_NAME: &str = "vault.burn";
+const DEVICE_LOCATOR_FILE_NAME: &str = "vault.device";
 
 /// Passphrases below this length are rejected during onboarding. This is a floor, not a
 /// strength meter: it exists to stop trivially short input, not to replace the Argon2id
@@ -61,6 +63,9 @@ pub(crate) struct VaultPaths {
     /// [`destruction_journal`] for why a damaged one is treated as a pending burn rather than
     /// as no burn at all.
     journal: PathBuf,
+    /// Where this identity's device-bound secret lives (`secure_device::DeviceLocator`) - a
+    /// TPM NV handle, never the secret. Written before the envelope, removed by Burn cleanup.
+    device_locator: PathBuf,
     /// Directory of encrypted attachment objects (`secure_attachments::store`). Deleted whole by
     /// Burn Identity; individual objects are deleted after a Burn Conversation destroys their keys.
     attachments: PathBuf,
@@ -82,6 +87,7 @@ impl VaultPaths {
             database: app_data_dir.join(DATABASE_FILE_NAME),
             attempts: app_data_dir.join(ATTEMPTS_FILE_NAME),
             journal: app_data_dir.join(BURN_JOURNAL_FILE_NAME),
+            device_locator: app_data_dir.join(DEVICE_LOCATOR_FILE_NAME),
             attachments: app_data_dir.join("attachments"),
             messaging_prefix: app_data_dir.join("simplex"),
             ghost_messaging_prefix: app_data_dir.join("ghost-simplex"),
@@ -181,6 +187,11 @@ struct GhostSession {
 pub(crate) struct AppRuntime {
     lifecycle: Mutex<AppLifecycle>,
     paths: VaultPaths,
+    /// Device-bound secret storage (`docs/backup-snapshot-hardening.md`): the TPM on supported
+    /// platforms, otherwise a store that refuses every operation so identity provisioning fails
+    /// closed. Burn destroys the identity's secret here, which is what makes a restored copy of
+    /// the data directory useless.
+    device: Arc<dyn DeviceSecretStore>,
     /// Shared (not cloned) with the messaging event sink while messaging is running, so a
     /// delivered `ChatEvent` can be persisted through the same handle `lock`/`unlock` use -
     /// there is exactly one `Option<UnlockedVault>` in the process, never a second copy that
@@ -216,6 +227,7 @@ impl AppRuntime {
         paths: VaultPaths,
         tor_state_dir: PathBuf,
         tor_cache_dir: PathBuf,
+        device: Arc<dyn DeviceSecretStore>,
     ) -> Result<Self, String> {
         let transport = TorTransport::new(&tor_state_dir, &tor_cache_dir)
             .map_err(|error| format!("failed to configure Tor transport: {error}"))?;
@@ -239,6 +251,7 @@ impl AppRuntime {
             let runtime = Self {
                 lifecycle: Mutex::new(AppLifecycle::resuming_destruction(stage)),
                 paths,
+                device,
                 unlocked: Arc::new(Mutex::new(None)),
                 transport: Mutex::new(Arc::new(transport)),
                 tor_state_dir,
@@ -272,11 +285,19 @@ impl AppRuntime {
         if !paths.vault_exists() {
             let _ = fs::remove_file(&paths.database);
             let _ = fs::remove_file(&paths.attempts);
+            // A locator with no envelope is a provisioning that crashed before the envelope was
+            // written: its device secret protects nothing, so release it.
+            if let Some(locator) = read_device_locator(&paths.device_locator)
+                && device.destroy(&locator).is_ok()
+            {
+                let _ = fs::remove_file(&paths.device_locator);
+            }
         }
 
         Ok(Self {
             lifecycle: Mutex::new(lifecycle),
             paths,
+            device,
             unlocked: Arc::new(Mutex::new(None)),
             transport: Mutex::new(Arc::new(transport)),
             tor_state_dir,
@@ -333,7 +354,7 @@ impl AppRuntime {
             // costs one pair of `remove_file` calls against files that are almost certainly
             // already gone - then the stale marker is removed so the data directory stops
             // advertising that an identity was burned here.
-            perform_destruction_step(DestructionEvent::DataCleanupFinished, self);
+            let _ = perform_destruction_step(DestructionEvent::DataCleanupFinished, self);
             destruction_journal::clear(&self.paths.journal);
             let _ = enter_fresh_provisioning(&mut lifecycle);
             return;
@@ -457,18 +478,48 @@ fn provision_new_vault(passphrase: &Zeroizing<String>, runtime: &AppRuntime) -> 
 
     let vault_key =
         VaultKey::generate().map_err(|_| "failed to generate vault master key".to_owned())?;
-    let envelope = VaultKeyEnvelope::seal(
+
+    // Fresh device-bound secret first: without one there is no production identity
+    // (self-destruct-semantics.md invariant 6 - no silent downgrade to a passphrase-only vault).
+    let (locator, device_secret) = runtime
+        .device
+        .create()
+        .map_err(|error| format!("cannot create a new identity: {error}"))?;
+    let undo = |runtime: &AppRuntime| {
+        let _ = fs::remove_file(&runtime.paths.envelope);
+        let _ = runtime.device.destroy(&locator);
+        let _ = fs::remove_file(&runtime.paths.device_locator);
+    };
+
+    // Locator before envelope: an envelope must never exist without a record of where its
+    // device secret is.
+    if let Err(error) =
+        write_file_atomically(&runtime.paths.device_locator, locator.encode().as_bytes())
+    {
+        undo(runtime);
+        return Err(format!("failed to persist the device locator: {error}"));
+    }
+
+    let envelope = match VaultKeyEnvelope::seal_device_bound(
         passphrase.as_bytes(),
+        &device_secret,
         &vault_key,
         Argon2Profile::RECOMMENDED_V1,
-    )
-    .map_err(|_| "failed to seal the vault key envelope".to_owned())?;
+    ) {
+        Ok(envelope) => envelope,
+        Err(_) => {
+            undo(runtime);
+            return Err("failed to seal the vault key envelope".to_owned());
+        }
+    };
 
-    write_file_atomically(&runtime.paths.envelope, &envelope.to_bytes())
-        .map_err(|error| format!("failed to persist the vault key envelope: {error}"))?;
+    if let Err(error) = write_file_atomically(&runtime.paths.envelope, &envelope.to_bytes()) {
+        undo(runtime);
+        return Err(format!("failed to persist the vault key envelope: {error}"));
+    }
 
     if let Err(error) = Vault::create_new(&runtime.paths.database, &vault_key) {
-        let _ = fs::remove_file(&runtime.paths.envelope);
+        undo(runtime);
         return Err(format!(
             "failed to create the encrypted vault database: {error}"
         ));
@@ -486,7 +537,7 @@ fn provision_new_vault(passphrase: &Zeroizing<String>, runtime: &AppRuntime) -> 
 /// crash-recovery design in [`destruction_journal`] can legitimately re-run a step whose work
 /// had already completed before the process died, and can equally re-run one whose journal entry
 /// was written moments before the crash prevented it running at all.
-fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
+fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) -> Result<(), String> {
     match event {
         // UiSealed: this backend function has no UI surface of its own to blank. By the time
         // this runs, the decision to destroy is already final - there is no further passphrase
@@ -527,8 +578,25 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
         // cannot be run backwards - so after this step no passphrase, however correct, can
         // recover it. Every later stage is disk hygiene over ciphertext that is already
         // cryptographically dead.
+        //
+        // The device-bound secret goes first (self-destruct-semantics.md: invalidate device-bound
+        // state, then destroy envelope access). Destroying it is what makes every *copy* of the
+        // envelope - backups, snapshots, a restored data directory - useless as well. If it
+        // cannot be destroyed right now (TPM unreachable), the envelope is still shredded, but the
+        // step reports failure so the burn pauses before this stage is journalled and retries it
+        // on the next launch instead of claiming a completeness it does not have.
         DestructionEvent::PersistentKeyAccessDestroyed => {
+            let device_result = match read_device_locator(&runtime.paths.device_locator) {
+                Some(locator) => runtime.device.destroy(&locator),
+                None => Ok(()),
+            };
             shred_file_best_effort(&runtime.paths.envelope);
+            device_result.map_err(|error| {
+                format!(
+                    "burn paused: the device-bound secret could not be destroyed yet ({error}); \
+                     it will be retried on the next launch"
+                )
+            })?;
         }
 
         // DataCleanupFinished: best-effort removal of what is now cryptographically useless
@@ -547,8 +615,10 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
             // replacement identity from tripping over the old store at the same prefix.
             remove_prefixed_files(&runtime.paths.messaging_prefix);
             let _ = AttachmentStore::destroy_all(&runtime.paths.attachments);
+            let _ = fs::remove_file(&runtime.paths.device_locator);
         }
     }
+    Ok(())
 }
 
 /// After a completed burn, move straight to fresh provisioning (onboarding a brand-new identity)
@@ -618,7 +688,7 @@ fn destroy_identity_locked(
         };
 
         // Act, then journal. See the ordering note above.
-        perform_destruction_step(event, runtime);
+        perform_destruction_step(event, runtime)?;
 
         lifecycle
             .apply_destruction(event)
@@ -717,13 +787,34 @@ pub(crate) fn unlock_application_impl(
         .map_err(|_| "vault key envelope is invalid or corrupt".to_owned())?;
 
     // Only a wrong *passphrase* against an otherwise-valid envelope counts toward the
-    // wipe-on-N-attempts failsafe below - a missing/corrupt envelope (already handled above)
-    // is a different failure class entirely and must not let an attacker force a wipe by
-    // damaging the envelope without ever guessing the passphrase.
-    let vault_key = match envelope.open(passphrase.as_bytes()) {
-        Ok(key) => key,
-        Err(_) => return Err(record_failed_unlock_attempt(&mut lifecycle, runtime)),
+    // wipe-on-N-attempts failsafe below - a missing/corrupt envelope or device secret is a
+    // different failure class entirely and must not let an attacker force a wipe by damaging
+    // state without ever guessing the passphrase.
+    let opened = if envelope.is_device_bound() {
+        let locator = read_device_locator(&runtime.paths.device_locator).ok_or_else(|| {
+            "this identity's device-bound state is missing or corrupt; it cannot be opened"
+                .to_owned()
+        })?;
+        let device_secret = runtime.device.read(&locator).map_err(|error| match error {
+            DeviceError::SecretGone => "this identity was destroyed on this device and cannot be \
+                                        recovered"
+                .to_owned(),
+            other => format!("cannot open this identity: {other}"),
+        })?;
+        envelope.open_device_bound(passphrase.as_bytes(), &device_secret)
+    } else {
+        envelope.open(passphrase.as_bytes())
     };
+    let vault_key = match opened {
+        Ok(key) => key,
+        Err(CryptoError::AuthenticationFailed) => {
+            return Err(record_failed_unlock_attempt(&mut lifecycle, runtime));
+        }
+        Err(_) => return Err("vault key envelope is invalid or corrupt".to_owned()),
+    };
+    if !envelope.is_device_bound() {
+        migrate_to_device_bound(&passphrase, &vault_key, runtime)?;
+    }
 
     let mut vault = Vault::open_existing(&runtime.paths.database, &vault_key)
         .map_err(|error| format!("failed to open the encrypted vault database: {error}"))?;
@@ -785,6 +876,47 @@ fn cleanup_burned_attachment_objects(vault: &mut Vault, paths: &VaultPaths) {
             let _ = vault.acknowledge_object_deleted(&name);
         }
     }
+}
+
+fn read_device_locator(path: &Path) -> Option<DeviceLocator> {
+    DeviceLocator::decode(&fs::read_to_string(path).ok()?).ok()
+}
+
+/// Re-seal a legacy passphrase-only envelope (format 1, created before device binding existed)
+/// as a device-bound one, after a successful unlock proved the passphrase. Fails closed: if no
+/// device-bound storage is available the unlock is refused rather than continuing on an envelope
+/// that a restored backup could reopen (self-destruct-semantics.md invariant 6). Crash-safe: the
+/// envelope is replaced atomically and last, so an interruption leaves the old envelope working
+/// and the migration simply runs again; a stale locator from that interruption is released first.
+fn migrate_to_device_bound(
+    passphrase: &Zeroizing<String>,
+    vault_key: &VaultKey,
+    runtime: &AppRuntime,
+) -> Result<(), String> {
+    if let Some(stale) = read_device_locator(&runtime.paths.device_locator) {
+        let _ = runtime.device.destroy(&stale);
+    }
+    let (locator, device_secret) = runtime.device.create().map_err(|error| {
+        format!("this vault must be upgraded to device-bound protection, which failed: {error}")
+    })?;
+    let result = (|| {
+        write_file_atomically(&runtime.paths.device_locator, locator.encode().as_bytes())
+            .map_err(|error| format!("failed to persist the device locator: {error}"))?;
+        let envelope = VaultKeyEnvelope::seal_device_bound(
+            passphrase.as_bytes(),
+            &device_secret,
+            vault_key,
+            Argon2Profile::RECOMMENDED_V1,
+        )
+        .map_err(|_| "failed to seal the upgraded vault key envelope".to_owned())?;
+        write_file_atomically(&runtime.paths.envelope, &envelope.to_bytes())
+            .map_err(|error| format!("failed to persist the upgraded envelope: {error}"))
+    })();
+    if result.is_err() {
+        let _ = runtime.device.destroy(&locator);
+        let _ = fs::remove_file(&runtime.paths.device_locator);
+    }
+    result
 }
 
 /// Increment the persisted failed-unlock counter and, once it reaches
@@ -1412,11 +1544,35 @@ mod tests {
 
     const PASSPHRASE: &str = "correct horse battery staple";
 
+    /// One simulated TPM per data directory, shared by every runtime built over it in a test - a
+    /// "restart" keeps the same device, as a real reboot keeps the same TPM - and held outside
+    /// the directory, so copying or restoring the directory does not copy it.
+    fn simulated_tpm(dir: &std::path::Path) -> Arc<secure_device::memory::MemoryStore> {
+        static DEVICES: std::sync::OnceLock<
+            Mutex<std::collections::HashMap<PathBuf, Arc<secure_device::memory::MemoryStore>>>,
+        > = std::sync::OnceLock::new();
+        DEVICES
+            .get_or_init(Default::default)
+            .lock()
+            .expect("device registry")
+            .entry(dir.to_path_buf())
+            .or_default()
+            .clone()
+    }
+
     fn runtime_in(dir: &std::path::Path) -> AppRuntime {
+        runtime_with_device(dir, simulated_tpm(dir))
+    }
+
+    fn runtime_with_device(
+        dir: &std::path::Path,
+        device: Arc<dyn DeviceSecretStore>,
+    ) -> AppRuntime {
         AppRuntime::new(
             VaultPaths::new(dir.to_path_buf()),
             dir.join("tor-state"),
             dir.join("tor-cache"),
+            device,
         )
         .expect("build test runtime")
     }
@@ -1737,9 +1893,14 @@ mod tests {
         // Prove the vault really was still recoverable at the moment of the crash, so the test
         // below is demonstrating recovery being *taken away*, not an already-dead vault.
         let envelope_bytes = fs::read(&runtime.paths.envelope).expect("envelope still on disk");
+        let locator = read_device_locator(&runtime.paths.device_locator).expect("locator");
+        let device_secret = runtime
+            .device
+            .read(&locator)
+            .expect("device secret still exists");
         VaultKeyEnvelope::from_bytes(&envelope_bytes)
             .expect("parses")
-            .open(PASSPHRASE.as_bytes())
+            .open_device_bound(PASSPHRASE.as_bytes(), &device_secret)
             .expect("the correct passphrase still opens the envelope pre-restart");
         drop(runtime);
 
@@ -1823,6 +1984,7 @@ mod tests {
             &restarted.paths.attempts,
             &restarted.paths.journal,
             &restarted.paths.attachments,
+            &restarted.paths.device_locator,
         ] {
             assert!(!path.exists(), "{} must not survive a burn", path.display());
         }
@@ -2041,13 +2203,10 @@ mod tests {
 
     /// `docs/self-destruct-semantics.md` invariant 5, verbatim. Restoring a pre-burn copy of the
     /// application-data directory must not resurrect the burned identity, even with its correct
-    /// passphrase. This FAILS today: every secret the identity needs lives in the data directory,
-    /// so the copy is sufficient. Making it pass requires device-bound anti-rollback state that is
-    /// not stored there (`docs/backup-snapshot-hardening.md`) - a platform primitive (e.g. a TPM
-    /// NV monotonic counter) and a reviewed key-combining design that have not been chosen yet.
-    /// Kept as an executable release blocker; `docs/release-checklist.md` section 4.
+    /// passphrase. Holds because the envelope is bound to a device secret that lives outside the
+    /// directory (simulated TPM here; `secure-device`'s swtpm tests cover the real backend) and
+    /// Burn destroyed it.
     #[test]
-    #[ignore = "RELEASE BLOCKER: device-bound anti-rollback state is not implemented yet"]
     fn restoring_a_pre_burn_copy_cannot_resurrect_the_burned_identity() {
         fn copy_dir(from: &Path, to: &Path) {
             fs::create_dir_all(to).expect("mkdir");
@@ -2078,9 +2237,174 @@ mod tests {
         fs::remove_dir_all(&data).expect("remove current data");
         copy_dir(&snapshot, &data);
         let restored = runtime_in(&data);
+        let error = unlock_application_impl(PASSPHRASE.to_owned(), &restored)
+            .expect_err("a pre-burn snapshot plus the old passphrase must not recover identity A");
+        assert!(error.contains("destroyed on this device"), "{error}");
+        assert_eq!(
+            read_failed_attempts(&restored.paths.attempts),
+            0,
+            "a destroyed identity is not a wrong passphrase and must not count toward the wipe"
+        );
+    }
+
+    #[test]
+    fn no_identity_is_created_without_device_bound_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_with_device(
+            dir.path(),
+            Arc::new(secure_device::UnavailableStore::new("no TPM in this test")),
+        );
+        let error = complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect_err("must fail closed, not fall back to a passphrase-only vault");
+        assert!(error.contains("cannot create a new identity"), "{error}");
+        for path in [
+            &runtime.paths.envelope,
+            &runtime.paths.database,
+            &runtime.paths.device_locator,
+        ] {
+            assert!(!path.exists(), "{} must not be left behind", path.display());
+        }
+        assert_eq!(
+            app_status_impl(&runtime).expect("status").state,
+            "onboarding"
+        );
+    }
+
+    #[test]
+    fn burn_destroys_the_device_secret_and_a_replacement_gets_a_fresh_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = simulated_tpm(dir.path());
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        let old = read_device_locator(&runtime.paths.device_locator).expect("locator");
+        assert_eq!(device.live_secrets(), 1);
+
+        burn_identity_impl(Some(REPLACEMENT_PASSPHRASE.to_owned()), &runtime).expect("burn");
+
+        assert!(matches!(device.read(&old), Err(DeviceError::SecretGone)));
+        let new = read_device_locator(&runtime.paths.device_locator).expect("new locator");
+        assert_ne!(old, new);
+        assert_eq!(
+            device.live_secrets(),
+            1,
+            "exactly the replacement's secret remains"
+        );
+
+        burn_identity_impl(None, &runtime).expect("burn the replacement too");
+        assert_eq!(device.live_secrets(), 0);
+        assert!(!runtime.paths.device_locator.exists());
+    }
+
+    #[test]
+    fn a_legacy_passphrase_only_vault_is_upgraded_to_device_bound_on_unlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        // Build the pre-device-binding layout by hand: a format-1 envelope, no locator.
+        let key = VaultKey::generate().expect("key");
+        let legacy =
+            VaultKeyEnvelope::seal(PASSPHRASE.as_bytes(), &key, Argon2Profile::RECOMMENDED_V1)
+                .expect("seal");
+        fs::write(&runtime.paths.envelope, legacy.to_bytes()).expect("envelope");
+        Vault::create_new(&runtime.paths.database, &key).expect("db");
+        drop(runtime);
+
+        let runtime = runtime_in(dir.path());
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime).expect("unlock legacy vault");
+
+        let envelope =
+            VaultKeyEnvelope::from_bytes(&fs::read(&runtime.paths.envelope).expect("read"))
+                .expect("parse");
         assert!(
-            unlock_application_impl(PASSPHRASE.to_owned(), &restored).is_err(),
-            "a pre-burn snapshot plus the old passphrase must not recover identity A"
+            envelope.is_device_bound(),
+            "envelope must have been upgraded"
+        );
+        assert!(read_device_locator(&runtime.paths.device_locator).is_some());
+        lock_application_impl(&runtime).expect("lock");
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect("the upgraded vault unlocks with the same passphrase");
+    }
+
+    #[test]
+    fn a_legacy_vault_is_not_opened_when_it_cannot_be_upgraded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = VaultKey::generate().expect("key");
+        let legacy =
+            VaultKeyEnvelope::seal(PASSPHRASE.as_bytes(), &key, Argon2Profile::RECOMMENDED_V1)
+                .expect("seal");
+        fs::write(dir.path().join(ENVELOPE_FILE_NAME), legacy.to_bytes()).expect("envelope");
+        Vault::create_new(&dir.path().join(DATABASE_FILE_NAME), &key).expect("db");
+        let runtime = runtime_with_device(
+            dir.path(),
+            Arc::new(secure_device::UnavailableStore::new("no TPM in this test")),
+        );
+
+        let error = unlock_application_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect_err("no silent downgrade: refuse rather than keep a passphrase-only vault");
+        assert!(error.contains("upgraded"), "{error}");
+        assert_eq!(app_status_impl(&runtime).expect("status").state, "locked");
+    }
+
+    /// Wraps the simulated TPM and fails `destroy` while `fail` is set.
+    struct FlakyDevice {
+        inner: Arc<secure_device::memory::MemoryStore>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    impl DeviceSecretStore for FlakyDevice {
+        fn create(&self) -> Result<(DeviceLocator, secure_device::DeviceSecret), DeviceError> {
+            self.inner.create()
+        }
+        fn read(
+            &self,
+            locator: &DeviceLocator,
+        ) -> Result<secure_device::DeviceSecret, DeviceError> {
+            self.inner.read(locator)
+        }
+        fn destroy(&self, locator: &DeviceLocator) -> Result<(), DeviceError> {
+            if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(DeviceError::Backend(
+                    "TPM unreachable in this test".to_owned(),
+                ));
+            }
+            self.inner.destroy(locator)
+        }
+    }
+
+    #[test]
+    fn burn_pauses_when_the_device_secret_cannot_be_destroyed_and_resumes_on_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tpm = simulated_tpm(dir.path());
+        let flaky = Arc::new(FlakyDevice {
+            inner: Arc::clone(&tpm),
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let runtime = runtime_with_device(dir.path(), flaky.clone());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+
+        let error = burn_identity_impl(None, &runtime).expect_err("must not claim completion");
+        assert!(error.contains("burn paused"), "{error}");
+        assert!(
+            !runtime.paths.envelope.exists(),
+            "the envelope is still shredded at once"
+        );
+        assert_eq!(
+            destruction_journal::read_stage(&runtime.paths.journal),
+            Some(DestructionStage::RuntimeSecretsRevoked),
+            "the key-destruction stage must not be journalled as done"
+        );
+        assert_eq!(tpm.live_secrets(), 1);
+        drop(runtime);
+
+        flaky.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        let restarted = runtime_with_device(dir.path(), flaky);
+        assert_eq!(
+            app_status_impl(&restarted).expect("status").state,
+            "onboarding"
+        );
+        assert_eq!(
+            tpm.live_secrets(),
+            0,
+            "the resumed burn destroyed the device secret"
         );
     }
 

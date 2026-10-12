@@ -46,13 +46,18 @@ CI's `remediation-gate` fails if a checked item there cites code that does not e
   its journal cannot be written, brute-force lockout, replacement-identity primitives, Ghost
   Session, and post-burn cleanup of the SimpleX store and attachment objects; a local-only static
   frontend with a restrictive CSP and no direct frontend network functionality;
+- device-bound anti-rollback (`secure-device`): each identity's vault-key envelope is also bound
+  to a random secret held in a TPM 2.0 NV index outside the data directory, and Burn destroys it,
+  so a restored pre-burn copy of the data directory cannot be reopened even with the old
+  passphrase. Linux only so far; see "Platform requirements" below;
 - CI on Linux and Windows: format, tests (core and desktop), clippy in both feature modes,
   cargo-deny, a CycloneDX SBOM and release metadata, with every action pinned to a commit SHA.
 
 Not yet implemented/completed (all release blockers - see `docs/release-checklist.md`):
 
-- device-bound anti-rollback enforcement (`docs/backup-snapshot-hardening.md`) and the fully
-  automatic post-Burn replacement semantics (`docs/self-destruct-semantics.md`);
+- a Windows device-bound backend (TPM via TBS/NCrypt). Until it exists, Windows builds refuse to
+  create or open an identity rather than fall back to passphrase-only protection;
+- independent review of the device-binding construction (`docs/backup-snapshot-hardening.md`);
 - live two-client SimpleX-over-Tor verification, kill-the-bridge and packet-capture evidence
   (these need the native core built from source and dedicated hosts);
 - SimpleX attachment transport and any UI for conversations or attachments;
@@ -83,6 +88,7 @@ crates/secure-storage/               encrypted vault persistence (SQLCipher) + B
 crates/secure-transport/             managed Tor transport (Arti)
 crates/secure-messaging/             SimpleX messaging adapter
 crates/secure-attachments/           encrypted attachment streaming primitives
+crates/secure-device/                device-bound (TPM 2.0) destruction secrets
 docs/security-architecture.md        security baseline
 docs/implementation-plan.md          phased implementation roadmap
 docs/security-remediation-plan.md    active remediation roadmap
@@ -91,6 +97,18 @@ docs/backup-snapshot-hardening.md    mandatory snapshot/rollback resistance requ
 docs/release-checklist.md            what must be true before any release or security claim
 docs/licensing.md                    messaging licensing decision (AGPLv3 client)
 ```
+
+## Platform requirements
+
+Secure refuses to create an identity unless it can bind it to device storage outside its data
+directory (`docs/self-destruct-semantics.md` invariant 6 - no silent downgrade):
+
+- **Linux:** a TPM 2.0 reachable at `/dev/tpmrm0` (usually: be a member of the `tss` group) with
+  the default empty owner authorization, and the `tpm2-tss` runtime libraries
+  (`libtss2-esys`, `libtss2-tctildr`). Building needs `libtss2-dev`.
+  `SECURE_TPM_TCTI` overrides the TPM connection (e.g. `swtpm:host=127.0.0.1,port=2321`).
+- **Windows:** not supported yet - identity creation fails closed until a Windows TPM backend
+  lands.
 
 ## Core checks
 
@@ -104,7 +122,16 @@ SECURE_SIMPLEX_NATIVE_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targe
 python3 scripts/check-plan-claims.py
 ```
 
-Desktop host (Linux needs the Tauri system packages listed in `.github/workflows/ci.yml`):
+TPM backend against a software TPM (`swtpm`):
+
+```bash
+swtpm socket --tpm2 --tpmstate dir=/tmp/tpm --server type=tcp,port=2321 \
+  --ctrl type=tcp,port=2322 --flags not-need-init,startup-clear --daemon
+SECURE_TPM_TCTI=swtpm:host=127.0.0.1,port=2321 \
+  cargo test --locked -p secure-device --features tpm -- --include-ignored
+```
+
+Desktop host (Linux needs the Tauri system packages and `libtss2-dev` listed in `.github/workflows/ci.yml`):
 
 ```bash
 cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml

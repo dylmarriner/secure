@@ -256,3 +256,25 @@ After the required release tests pass, Secure may state narrowly:
 > Burn permanently revokes the local cryptographic identity and automatically creates a fresh unrelated identity. Restoring an old copy of Secure's application-controlled data does not restore a burned identity on supported Secure production platforms, because the old state also depends on device-bound anti-rollback key material invalidated by Burn.
 
 Secure MUST NOT claim that privileged software is physically incapable of copying bytes, that live RAM compromise is impossible, or that another participant's independent copy can be forcibly erased.
+## Implementation status (2026-10-12)
+
+Implemented on Linux, pending independent review:
+
+- `crates/secure-device`: each identity has a random 32-byte secret in a TPM 2.0 NV index (owner
+  hierarchy, random handle in the owner range). The data directory stores only its locator
+  (`vault.device`), never the secret.
+- `crates/secure-crypto`: vault-key envelope format 2 wraps the vault key under
+  `HKDF-SHA-256(salt = device secret, ikm = Argon2id(passphrase), info =
+  "secure/vault-wrapping-key/v2")`. The format byte is authenticated, so a format-2 envelope
+  cannot be relabelled to the passphrase-only format 1.
+- Burn destroys the device secret (overwrite, then undefine) before shredding the envelope. If the
+  TPM cannot be reached, the burn pauses before that stage is journalled and resumes on the next
+  launch.
+- Identity creation, and the upgrade of a legacy format-1 vault, fail closed without a usable TPM.
+- Evidence: `restoring_a_pre_burn_copy_cannot_resurrect_the_burned_identity` and the other desktop
+  tests use a simulated TPM held outside the data directory; `crates/secure-device/tests/tpm_nv.rs`
+  exercises the real TPM code path against swtpm in CI.
+
+Not covered (as stated above, and in `crates/secure-device/src/tpm.rs`): VM snapshots that include
+virtual-TPM state, live compromise while unlocked, a physical TPM-bus interposer (the NV read uses
+an unsalted session), and Windows, which has no backend yet and therefore refuses to provision.

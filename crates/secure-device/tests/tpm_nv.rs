@@ -2,7 +2,7 @@
 //! `swtpm socket --tpm2 --server type=tcp,port=2321 --ctrl type=tcp,port=2322 \
 //!   --tpmstate dir=/tmp/tpm --flags not-need-init,startup-clear` and
 //! `SECURE_TPM_TCTI=swtpm:host=127.0.0.1,port=2321 cargo test -p secure-device --features tpm -- --ignored`.
-#![cfg(feature = "tpm")]
+#![cfg(all(feature = "tpm", target_os = "linux"))]
 
 use secure_device::tpm::TpmNvStore;
 use secure_device::{DeviceError, DeviceLocator, DeviceSecretStore};

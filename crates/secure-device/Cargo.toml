@@ -10,10 +10,13 @@ publish = false
 rand_core.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 tss-esapi = { version = "7.7", optional = true }
 
 [features]
 # Linux TPM 2.0 backend (tpm2-tss system libraries, /dev/tpmrm0 or a TCTI from the environment).
+# A no-op on other platforms, whose builds therefore fail closed through UnavailableStore.
 tpm = ["dep:tss-esapi"]
 # In-memory store for tests only. Never enable in a shipped build: it keeps the "device" secret
 # in process memory, so it provides no anti-rollback property at all.

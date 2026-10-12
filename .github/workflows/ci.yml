@@ -42,6 +42,9 @@ jobs:
       - name: Install NASM (Windows, required to build vendored OpenSSL for SQLCipher)
         if: ${{ runner.os == 'Windows' }}
         uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - name: Install tpm2-tss (Linux, for secure-device's tpm feature under --all-features)
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
@@ -76,6 +79,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
+            libtss2-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             patchelf
@@ -111,6 +115,33 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
 
+  # The device-bound anti-rollback backend against a real TPM 2.0 implementation (swtpm), so
+  # Burn's "a restored backup cannot reopen the identity" guarantee is exercised end to end on
+  # the TPM code path, not only against the in-memory test store the desktop tests use.
+  tpm-swtpm:
+    name: TPM 2.0 device-secret backend (swtpm)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install swtpm and tpm2-tss
+        run: sudo apt-get update && sudo apt-get install -y swtpm libtss2-dev
+      - name: Start swtpm
+        run: |
+          mkdir -p "$RUNNER_TEMP/tpm"
+          swtpm socket --tpm2 --tpmstate dir="$RUNNER_TEMP/tpm" \
+            --server type=tcp,port=2321 --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --daemon
+      - name: TPM tests
+        env:
+          SECURE_TPM_TCTI: swtpm:host=127.0.0.1,port=2321
+        run: cargo test --locked -p secure-device --features tpm -- --include-ignored
+
   supply-chain:
     name: Supply chain (cargo-deny, SBOM, release metadata)
     runs-on: ubuntu-latest
@@ -144,7 +175,7 @@ jobs:
   remediation-gate:
     name: Security remediation gate (docs/security-remediation-plan.md)
     runs-on: ubuntu-latest
-    needs: [rust-core, desktop-linux, desktop-windows, supply-chain]
+    needs: [rust-core, desktop-linux, desktop-windows, tpm-swtpm, supply-chain]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
