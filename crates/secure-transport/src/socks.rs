@@ -86,14 +86,16 @@ impl TorSocksProxy {
                         connections.spawn(async move {
                             let mut conn_proxy_shutdown = conn_proxy_shutdown;
                             let mut conn_transport_shutdown = conn_transport_shutdown;
-                            let _ = serve(
-                                socket,
-                                &lifecycle,
-                                &client,
-                                &mut conn_proxy_shutdown,
-                                &mut conn_transport_shutdown,
-                            )
-                            .await;
+                            // A shutdown signal wins against *every* stage of a connection - the
+                            // SOCKS handshake, the Tor connect, and the transfer. Dropping the
+                            // `serve` future closes the local socket and any Tor stream it holds.
+                            // Racing only the transfer (as an earlier version did) let a client
+                            // that connected and then sent nothing block `shutdown` forever.
+                            tokio::select! {
+                                _ = serve(socket, &lifecycle, &client) => {}
+                                () = wait_for_shutdown(&mut conn_proxy_shutdown) => {}
+                                () = wait_for_shutdown(&mut conn_transport_shutdown) => {}
+                            }
                         });
                     }
                     _ = wait_for_shutdown(&mut proxy_shutdown) => break,
@@ -135,6 +137,9 @@ impl Drop for TorSocksProxy {
     }
 }
 
+/// How long a local client has to complete the SOCKS5 handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Resolves once `rx` carries (or ever changes to) `true`. Checks the current value first so a
 /// receiver subscribed after the flip does not miss it by waiting on `changed()` alone.
 async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
@@ -175,10 +180,10 @@ async fn serve(
     mut socket: TcpStream,
     lifecycle: &Mutex<TransportLifecycle>,
     client: &Mutex<Option<Arc<TorClient<PreferredRuntime>>>>,
-    proxy_shutdown: &mut watch::Receiver<bool>,
-    transport_shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let request = read_request(&mut socket).await?;
+    // Local clients get a bounded time to finish the SOCKS handshake, so a silent connection
+    // cannot hold a task (and its socket) open indefinitely.
+    let request = tokio::time::timeout(HANDSHAKE_TIMEOUT, read_request(&mut socket)).await??;
 
     if request.command() != SocksCmd::CONNECT {
         socket
@@ -224,14 +229,9 @@ async fn serve(
         .write_all(&request.reply(SocksStatus::SUCCEEDED, None)?)
         .await?;
 
-    // A shutdown signal wins the race against an in-progress transfer: dropping the
-    // `copy_bidirectional` future here drops and closes both `socket` and `stream`, so neither
-    // side of an already-proxied connection survives past `stop`/`shutdown`.
-    tokio::select! {
-        result = tokio::io::copy_bidirectional(&mut socket, &mut stream) => { result?; }
-        () = wait_for_shutdown(proxy_shutdown) => {}
-        () = wait_for_shutdown(transport_shutdown) => {}
-    }
+    // Shutdown is raced by the caller around this whole function, so dropping this future
+    // mid-transfer closes both `socket` and `stream`.
+    tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
     Ok(())
 }
 
@@ -261,9 +261,65 @@ async fn read_request(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use arti_client::isolation::Isolation;
 
     use super::*;
+
+    async fn proxy_without_tor() -> (TorSocksProxy, watch::Sender<bool>) {
+        let (transport_tx, transport_rx) = watch::channel(false);
+        let proxy = TorSocksProxy::start(
+            Arc::new(Mutex::new(TransportLifecycle::new())),
+            Arc::new(Mutex::new(None)),
+            transport_rx,
+        )
+        .await
+        .expect("bind loopback listener");
+        (proxy, transport_tx)
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_while_a_client_is_stalled_mid_handshake() {
+        let (proxy, _transport) = proxy_without_tor().await;
+        // Connects and sends nothing; a second client sends only a partial greeting.
+        let _silent = TcpStream::connect(proxy.address()).await.expect("connect");
+        let mut partial = TcpStream::connect(proxy.address()).await.expect("connect");
+        partial.write_all(&[5]).await.expect("partial greeting");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::timeout(Duration::from_secs(5), proxy.shutdown())
+            .await
+            .expect("shutdown must not wait on a client that never finishes its handshake");
+    }
+
+    #[tokio::test]
+    async fn transport_stop_releases_a_stalled_client_too() {
+        let (proxy, transport) = proxy_without_tor().await;
+        let mut silent = TcpStream::connect(proxy.address()).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        transport.send(true).expect("signal transport stop");
+        let mut buf = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut buf))
+            .await
+            .expect("the proxy must close the stalled connection");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "connection must be closed, got {read:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(5), proxy.shutdown())
+            .await
+            .expect("shutdown after transport stop");
+    }
+
+    #[tokio::test]
+    async fn a_connection_after_shutdown_is_refused() {
+        let (proxy, _transport) = proxy_without_tor().await;
+        let address = proxy.address();
+        proxy.shutdown().await;
+        assert!(TcpStream::connect(address).await.is_err());
+    }
 
     #[test]
     fn same_socks_auth_is_compatible_isolation() {
