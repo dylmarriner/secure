@@ -17,7 +17,17 @@ use thiserror::Error;
 use zeroize::{Zeroize, Zeroizing};
 
 const MAGIC: &[u8; 4] = b"SVK1";
-const FORMAT_VERSION: u8 = 1;
+/// Passphrase-only envelope (legacy). Opened only to migrate it to [`DEVICE_BOUND_VERSION`].
+const PASSPHRASE_ONLY_VERSION: u8 = 1;
+/// Envelope whose wrapping key also depends on a device-bound secret (`secure-device`), so the
+/// envelope plus the passphrase is not enough to recover the vault key once that secret is
+/// destroyed (`docs/backup-snapshot-hardening.md`).
+const DEVICE_BOUND_VERSION: u8 = 2;
+/// Length of the device-bound secret mixed into a version-2 wrapping key.
+pub const DEVICE_SECRET_LEN: usize = 32;
+/// HKDF `info` for the version-2 wrapping key: domain-separates it from every other use of the
+/// Argon2id output or the device secret.
+const DEVICE_BOUND_KEK_INFO: &[u8] = b"secure/vault-wrapping-key/v2";
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const VAULT_KEY_LEN: usize = 32;
@@ -40,6 +50,10 @@ pub enum CryptoError {
     AuthenticationFailed,
     #[error("invalid vault-key envelope")]
     InvalidEnvelope,
+    #[error("this envelope is bound to a device secret; open it with open_device_bound")]
+    DeviceSecretRequired,
+    #[error("this is a legacy passphrase-only envelope; open it with open")]
+    NotDeviceBound,
     #[error("subkey derivation failed")]
     SubkeyDerivationFailed,
     #[error("messaging-record encryption failed")]
@@ -232,6 +246,7 @@ fn messaging_record_aad(conversation_id: &str, direction: &str) -> Vec<u8> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VaultKeyEnvelope {
+    version: u8,
     profile: Argon2Profile,
     salt: [u8; SALT_LEN],
     nonce: [u8; NONCE_LEN],
@@ -239,8 +254,44 @@ pub struct VaultKeyEnvelope {
 }
 
 impl VaultKeyEnvelope {
+    /// Seal `key` under the passphrase alone (format version 1).
+    ///
+    /// Legacy: such an envelope plus its passphrase recovers the key from any copy of the file, so
+    /// it cannot satisfy Burn's anti-rollback requirement. Production code seals with
+    /// [`Self::seal_device_bound`]; this remains for migrating existing vaults and for tests.
     pub fn seal(
         passphrase: &[u8],
+        key: &VaultKey,
+        profile: Argon2Profile,
+    ) -> Result<Self, CryptoError> {
+        Self::seal_version(PASSPHRASE_ONLY_VERSION, passphrase, None, key, profile)
+    }
+
+    /// Seal `key` so that unwrapping needs both the passphrase and `device_secret` (format
+    /// version 2). The wrapping key is `HKDF-SHA-256(salt = device_secret, ikm = Argon2id(
+    /// passphrase), info = "secure/vault-wrapping-key/v2")`: the device secret is uniformly
+    /// random, so using it as the HKDF-Extract salt is the standard way to bind a second key into
+    /// a derivation, and the version byte is authenticated so a version-2 envelope cannot be
+    /// relabelled as version 1 to drop the device secret.
+    pub fn seal_device_bound(
+        passphrase: &[u8],
+        device_secret: &[u8; DEVICE_SECRET_LEN],
+        key: &VaultKey,
+        profile: Argon2Profile,
+    ) -> Result<Self, CryptoError> {
+        Self::seal_version(
+            DEVICE_BOUND_VERSION,
+            passphrase,
+            Some(device_secret),
+            key,
+            profile,
+        )
+    }
+
+    fn seal_version(
+        version: u8,
+        passphrase: &[u8],
+        device_secret: Option<&[u8; DEVICE_SECRET_LEN]>,
         key: &VaultKey,
         profile: Argon2Profile,
     ) -> Result<Self, CryptoError> {
@@ -253,10 +304,10 @@ impl VaultKeyEnvelope {
         rng.try_fill_bytes(&mut nonce)
             .map_err(|_| CryptoError::RandomnessUnavailable)?;
 
-        let wrapping_key = derive_wrapping_key(passphrase, &salt, profile)?;
+        let wrapping_key = wrapping_key(passphrase, device_secret, &salt, profile)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
             .map_err(|_| CryptoError::EncryptionFailed)?;
-        let aad = authenticated_header(profile, &salt, &nonce);
+        let aad = authenticated_header(version, profile, &salt, &nonce);
         let ciphertext = cipher
             .encrypt(
                 XNonce::from_slice(&nonce),
@@ -272,6 +323,7 @@ impl VaultKeyEnvelope {
         }
 
         Ok(Self {
+            version,
             profile,
             salt,
             nonce,
@@ -279,11 +331,42 @@ impl VaultKeyEnvelope {
         })
     }
 
+    /// Whether this envelope needs a device secret ([`Self::open_device_bound`]).
+    #[must_use]
+    pub fn is_device_bound(&self) -> bool {
+        self.version == DEVICE_BOUND_VERSION
+    }
+
+    /// Open a legacy passphrase-only envelope. Refuses a device-bound one.
     pub fn open(&self, passphrase: &[u8]) -> Result<VaultKey, CryptoError> {
-        let wrapping_key = derive_wrapping_key(passphrase, &self.salt, self.profile)?;
+        if self.is_device_bound() {
+            return Err(CryptoError::DeviceSecretRequired);
+        }
+        self.open_with(passphrase, None)
+    }
+
+    /// Open a device-bound envelope. Refuses a legacy one, so a caller can never be tricked into
+    /// skipping the device secret by being handed an older file.
+    pub fn open_device_bound(
+        &self,
+        passphrase: &[u8],
+        device_secret: &[u8; DEVICE_SECRET_LEN],
+    ) -> Result<VaultKey, CryptoError> {
+        if !self.is_device_bound() {
+            return Err(CryptoError::NotDeviceBound);
+        }
+        self.open_with(passphrase, Some(device_secret))
+    }
+
+    fn open_with(
+        &self,
+        passphrase: &[u8],
+        device_secret: Option<&[u8; DEVICE_SECRET_LEN]>,
+    ) -> Result<VaultKey, CryptoError> {
+        let wrapping_key = wrapping_key(passphrase, device_secret, &self.salt, self.profile)?;
         let cipher = XChaCha20Poly1305::new_from_slice(&*wrapping_key)
             .map_err(|_| CryptoError::AuthenticationFailed)?;
-        let aad = authenticated_header(self.profile, &self.salt, &self.nonce);
+        let aad = authenticated_header(self.version, self.profile, &self.salt, &self.nonce);
         let plaintext = Zeroizing::new(
             cipher
                 .decrypt(
@@ -309,7 +392,7 @@ impl VaultKeyEnvelope {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut encoded = Vec::with_capacity(FIXED_HEADER_LEN + self.ciphertext.len());
         encoded.extend_from_slice(MAGIC);
-        encoded.push(FORMAT_VERSION);
+        encoded.push(self.version);
         encoded.extend_from_slice(&self.profile.memory_kib.to_be_bytes());
         encoded.extend_from_slice(&self.profile.iterations.to_be_bytes());
         encoded.extend_from_slice(&self.profile.parallelism.to_be_bytes());
@@ -327,7 +410,7 @@ impl VaultKeyEnvelope {
 
         let mut cursor = 4;
         let version = read_u8(bytes, &mut cursor)?;
-        if version != FORMAT_VERSION {
+        if version != PASSPHRASE_ONLY_VERSION && version != DEVICE_BOUND_VERSION {
             return Err(CryptoError::InvalidEnvelope);
         }
 
@@ -346,12 +429,32 @@ impl VaultKeyEnvelope {
         }
 
         Ok(Self {
+            version,
             profile,
             salt,
             nonce,
             ciphertext: bytes[cursor..].to_vec(),
         })
     }
+}
+
+/// The XChaCha20-Poly1305 key that wraps the vault key: the Argon2id output for a legacy
+/// envelope, or that output bound to the device secret with HKDF for a device-bound one.
+fn wrapping_key(
+    passphrase: &[u8],
+    device_secret: Option<&[u8; DEVICE_SECRET_LEN]>,
+    salt: &[u8; SALT_LEN],
+    profile: Argon2Profile,
+) -> Result<Zeroizing<[u8; VAULT_KEY_LEN]>, CryptoError> {
+    let stretched = derive_wrapping_key(passphrase, salt, profile)?;
+    let Some(device_secret) = device_secret else {
+        return Ok(stretched);
+    };
+    let mut bound = Zeroizing::new([0_u8; VAULT_KEY_LEN]);
+    Hkdf::<Sha256>::new(Some(device_secret), &*stretched)
+        .expand(DEVICE_BOUND_KEK_INFO, &mut *bound)
+        .map_err(|_| CryptoError::KeyDerivationFailed)?;
+    Ok(bound)
 }
 
 fn derive_wrapping_key(
@@ -369,13 +472,14 @@ fn derive_wrapping_key(
 }
 
 fn authenticated_header(
+    version: u8,
     profile: Argon2Profile,
     salt: &[u8; SALT_LEN],
     nonce: &[u8; NONCE_LEN],
 ) -> Vec<u8> {
     let mut aad = Vec::with_capacity(FIXED_HEADER_LEN - 4);
     aad.extend_from_slice(MAGIC);
-    aad.push(FORMAT_VERSION);
+    aad.push(version);
     aad.extend_from_slice(&profile.memory_kib.to_be_bytes());
     aad.extend_from_slice(&profile.iterations.to_be_bytes());
     aad.extend_from_slice(&profile.parallelism.to_be_bytes());
