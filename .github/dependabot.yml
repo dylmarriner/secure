@@ -10,3 +10,9 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+  # The desktop host has its own lockfile outside the workspace.
+  - package-ecosystem: cargo
+    directory: /apps/desktop/src-tauri
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
