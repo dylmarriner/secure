@@ -314,11 +314,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_connection_after_shutdown_is_refused() {
-        let (proxy, _transport) = proxy_without_tor().await;
+    async fn socks_listener_refuses_after_stop() {
+        let (proxy, transport) = proxy_without_tor().await;
         let address = proxy.address();
-        proxy.shutdown().await;
-        assert!(TcpStream::connect(address).await.is_err());
+        transport.send(true).expect("signal transport stop");
+        tokio::time::timeout(Duration::from_secs(5), proxy.shutdown())
+            .await
+            .expect("shutdown after stop");
+        assert!(
+            TcpStream::connect(address).await.is_err(),
+            "the listener must be closed once the transport stops"
+        );
     }
 
     #[test]

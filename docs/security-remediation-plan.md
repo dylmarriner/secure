@@ -199,22 +199,21 @@ No destructive action occurs before a durable burn marker exists, and every cras
 
 ## Required regression tests
 
-- [x] `stop_wins_against_late_bootstrap_completion` (drives the real lifecycle directly - `Start`
-      then `Stop`, then asserts the late `BootstrapSucceeded` is rejected and no client is
-      installed - rather than mocking Arti's bootstrap future, since this crate has no seam to
-      inject one without a larger refactor).
+- [x] `stop_wins_against_late_bootstrap_completion` - `Start`, then `Stop`, then a late
+      completion carrying a real (unbootstrapped, network-free) Arti client through
+      `TorTransport::finish_bootstrap`; asserts the completion is rejected and the client is not
+      left installed. (Corrected 2026-10-12: the earlier version never installed a client, so its
+      "no client installed" assertion could not fail.)
 - [x] `stop_broadcasts_shutdown_to_socks_proxy_subscribers` proves the transport-to-proxy signal
-      path itself (no live Tor needed). `stop_aborts_existing_socks_streams` with a real proxied
-      byte stream is now covered by the live/ignored `bootstraps_and_connects_over_the_real_tor_network`
-      test in `live_bootstrap.rs` (see below) rather than a separate test, matching this crate's
-      existing testing split (pure logic unit-tested, real Arti I/O covered by `#[ignore]`d live
-      tests).
-- [x] `socks_listener_refuses_after_stop` - already covered pre-R2 by
-      `socks_proxy_before_start_refuses_without_binding_a_port` (`start_socks_proxy` refuses
-      before `Ready`) and `ready_client`'s lifecycle check, which every accepted SOCKS `CONNECT`
-      re-runs regardless of when `stop` happens.
-- [x] `no_client_is_installed_after_stopped_state` - covered by
-      `stop_wins_against_late_bootstrap_completion`.
+      path. Stopping existing proxied connections is covered network-free by
+      `transport_stop_releases_a_stalled_client_too` and
+      `shutdown_completes_while_a_client_is_stalled_mid_handshake` (added 2026-10-12 together
+      with the fix for a real hang: the SOCKS handshake and Tor connect were not raced against
+      shutdown, so a silent local client blocked `TorSocksProxy::shutdown` - and lock - forever).
+- [x] `socks_listener_refuses_after_stop` (added 2026-10-12; previously claimed as covered by a
+      before-start test only).
+- [x] `no_client_is_installed_after_stopped_state` (added 2026-10-12; previously claimed as
+      covered by the vacuous race test above).
 - [x] live Tor test confirms a proxied stream works before stop and is unusable after stop.
       (`crates/secure-transport/tests/live_bootstrap.rs`, run against the real Tor network:
       connects through the SOCKS proxy, shuts it down, asserts a fresh connect to the same
