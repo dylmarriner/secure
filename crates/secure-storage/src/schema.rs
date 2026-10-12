@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rand_core::{OsRng, RngCore};
 use rusqlite::OptionalExtension;
+use zeroize::Zeroizing;
 
 use crate::{StorageError, Vault};
 
@@ -102,4 +103,58 @@ pub(crate) fn insert_message_with_direction(
         rusqlite::params![id, conversation_id, direction, ciphertext, now_unix_ms()],
     )?;
     Ok(id)
+}
+
+pub(crate) fn insert_attachment(
+    vault: &mut Vault,
+    message_id: &str,
+    object_name: &str,
+    content_type: &str,
+    expected_size_bytes: u64,
+    attachment_key: &[u8; 32],
+) -> Result<String, StorageError> {
+    let id = random_id();
+    vault.connection_mut().execute(
+        "INSERT INTO attachments \
+         (id, message_id, object_name, content_type, expected_size_bytes, attachment_key, \
+          created_at_unix_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
+        rusqlite::params![
+            id,
+            message_id,
+            object_name,
+            content_type,
+            i64::try_from(expected_size_bytes).unwrap_or(i64::MAX),
+            attachment_key.as_slice(),
+            now_unix_ms()
+        ],
+    )?;
+    Ok(id)
+}
+
+pub(crate) fn attachment(
+    vault: &Vault,
+    attachment_id: &str,
+) -> Result<crate::StoredAttachment, StorageError> {
+    let row: Option<(String, Option<String>, Zeroizing<Vec<u8>>)> = vault
+        .conn
+        .query_row(
+            "SELECT object_name, content_type, attachment_key FROM attachments WHERE id = ?1;",
+            rusqlite::params![attachment_id],
+            |row| Ok((row.get(0)?, row.get(1)?, Zeroizing::new(row.get(2)?))),
+        )
+        .optional()?;
+    let Some((object_name, content_type, key_bytes)) = row else {
+        return Err(StorageError::AttachmentNotFound);
+    };
+    // A destroyed key is an empty blob (see `burn`); anything not exactly 32 bytes is unusable.
+    let key: [u8; 32] = key_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| StorageError::AttachmentNotFound)?;
+    Ok(crate::StoredAttachment {
+        object_name,
+        content_type,
+        key: Zeroizing::new(key),
+    })
 }

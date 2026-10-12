@@ -4472,6 +4472,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "secure-attachments"
+version = "0.1.0"
+dependencies = [
+ "chacha20poly1305",
+ "rand_core 0.6.4",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "secure-core"
 version = "0.1.0"
 dependencies = [
@@ -4498,6 +4508,7 @@ name = "secure-desktop"
 version = "0.1.0"
 dependencies = [
  "rand_core 0.6.4",
+ "secure-attachments",
  "secure-core",
  "secure-crypto",
  "secure-messaging",

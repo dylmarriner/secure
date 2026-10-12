@@ -13,6 +13,7 @@ tauri-build = { version = "2", features = [] }
 secure-core = { path = "../../../crates/secure-core" }
 secure-crypto = { path = "../../../crates/secure-crypto" }
 secure-messaging = { path = "../../../crates/secure-messaging" }
+secure-attachments = { path = "../../../crates/secure-attachments" }
 secure-storage = { path = "../../../crates/secure-storage" }
 secure-transport = { path = "../../../crates/secure-transport" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }

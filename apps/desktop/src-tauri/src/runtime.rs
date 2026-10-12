@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rand_core::{OsRng, RngCore};
+use secure_attachments::store::AttachmentStore;
 use secure_core::{AppEvent, AppLifecycle, AppState, DestructionEvent, DestructionStage};
 use secure_crypto::{Argon2Profile, VaultKey, VaultKeyEnvelope};
 use secure_storage::Vault;
@@ -60,14 +61,17 @@ pub(crate) struct VaultPaths {
     /// [`destruction_journal`] for why a damaged one is treated as a pending burn rather than
     /// as no burn at all.
     journal: PathBuf,
-    #[cfg(feature = "simplex-native")]
+    /// Directory of encrypted attachment objects (`secure_attachments::store`). Deleted whole by
+    /// Burn Identity; individual objects are deleted after a Burn Conversation destroys their keys.
+    attachments: PathBuf,
+    /// The normal identity's SimpleX store prefix. Not feature-gated: a store created by a
+    /// `simplex-native` build must still be cleaned up by Burn Identity in any build.
     messaging_prefix: PathBuf,
     /// A different file prefix from `messaging_prefix`, so a Ghost session's SimpleX store can
     /// never be the normal vault's - see [`GhostSession`]/the Ghost checklist in this phase's
     /// plan. Reused (not randomised) across Ghost sessions: only one Ghost session is ever
     /// active at a time, and it is always cleaned up (best-effort) before reuse, both at
     /// `AppRuntime::new` (restart) and at the start/end of every Ghost session.
-    #[cfg(feature = "simplex-native")]
     ghost_messaging_prefix: PathBuf,
 }
 
@@ -78,9 +82,8 @@ impl VaultPaths {
             database: app_data_dir.join(DATABASE_FILE_NAME),
             attempts: app_data_dir.join(ATTEMPTS_FILE_NAME),
             journal: app_data_dir.join(BURN_JOURNAL_FILE_NAME),
-            #[cfg(feature = "simplex-native")]
+            attachments: app_data_dir.join("attachments"),
             messaging_prefix: app_data_dir.join("simplex"),
-            #[cfg(feature = "simplex-native")]
             ghost_messaging_prefix: app_data_dir.join("ghost-simplex"),
         }
     }
@@ -117,7 +120,6 @@ fn write_failed_attempts(path: &Path, count: u32) -> io::Result<()> {
 /// actual boundary is that the store's key is never persisted anywhere, so leftover ciphertext
 /// is unreadable even if this cleanup misses a file (best-effort, same as `burn`'s own
 /// ciphertext cleanup - the OS/filesystem may still retain remnants this cannot reach).
-#[cfg(feature = "simplex-native")]
 fn remove_prefixed_files(prefix: &Path) {
     let (Some(parent), Some(file_prefix)) = (prefix.parent(), prefix.file_name()) else {
         return;
@@ -214,7 +216,6 @@ impl AppRuntime {
         // orphaned from a session that ended without a clean `end_ghost`, e.g. a crash. Best
         // effort, matching this phase's Ghost checklist: cleanup ("delete ciphertext best-effort
         // on Ghost end/restart") does not claim the OS/filesystem cannot retain remnants.
-        #[cfg(feature = "simplex-native")]
         remove_prefixed_files(&paths.ghost_messaging_prefix);
 
         // An interrupted Burn Identity takes precedence over every other startup path. This is
@@ -496,6 +497,12 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
         DestructionEvent::DataCleanupFinished => {
             shred_file_best_effort(&runtime.paths.database);
             let _ = fs::remove_file(&runtime.paths.attempts);
+            // The SimpleX store and attachment objects are keyed from (or by keys stored in) the
+            // now-destroyed vault, so they are already unreadable; removing them is the mandatory
+            // post-burn cleanup attempt (`docs/self-destruct-semantics.md`), and it also keeps a
+            // replacement identity from tripping over the old store at the same prefix.
+            remove_prefixed_files(&runtime.paths.messaging_prefix);
+            let _ = AttachmentStore::destroy_all(&runtime.paths.attachments);
         }
     }
 }
@@ -661,8 +668,9 @@ pub(crate) fn unlock_application_impl(
         Err(_) => return Err(record_failed_unlock_attempt(&mut lifecycle, runtime)),
     };
 
-    let vault = Vault::open_existing(&runtime.paths.database, &vault_key)
+    let mut vault = Vault::open_existing(&runtime.paths.database, &vault_key)
         .map_err(|error| format!("failed to open the encrypted vault database: {error}"))?;
+    finish_interrupted_destruction(&mut vault, &runtime.paths)?;
 
     // A correct passphrase resets the counter: only *consecutive* wrong attempts should ever
     // be able to trigger destruction, not a lifetime total across many successful sessions.
@@ -683,6 +691,43 @@ pub(crate) fn unlock_application_impl(
         .map_err(|error| error.to_string())?;
 
     Ok(status_for(lifecycle.state()))
+}
+
+/// Drive any Burn Conversation a previous run left incomplete to `Complete`, then delete the
+/// attachment objects whose keys a burn already destroyed (Phase R6). Runs on every unlock,
+/// before the vault is handed to anything else.
+///
+/// Resuming the burn is fail-closed - the unlock is refused if it cannot finish, so a
+/// conversation the user ordered destroyed is never shown again. Deleting the already-unreadable
+/// ciphertext files is best-effort: a name stays queued until its file is confirmed gone, so it
+/// is retried on the next unlock.
+fn finish_interrupted_destruction(vault: &mut Vault, paths: &VaultPaths) -> Result<(), String> {
+    secure_storage::burn::resume_incomplete_conversation_burns(vault).map_err(|error| {
+        format!("could not finish an interrupted conversation burn ({error}) - vault left locked")
+    })?;
+    cleanup_burned_attachment_objects(vault, paths);
+    Ok(())
+}
+
+fn cleanup_burned_attachment_objects(vault: &mut Vault, paths: &VaultPaths) {
+    let Ok(store) = AttachmentStore::open(&paths.attachments) else {
+        return;
+    };
+    let _ = store.sweep_partials();
+    let Ok(pending) = vault.pending_object_deletions() else {
+        return;
+    };
+    for name in pending {
+        // An invalid name can only come from a damaged row; it can never address a file, so it
+        // is dropped from the queue rather than retried forever.
+        let removed = match store.remove_object(&name) {
+            Ok(()) | Err(secure_attachments::AttachmentError::InvalidObjectName) => true,
+            Err(_) => false,
+        };
+        if removed {
+            let _ = vault.acknowledge_object_deleted(&name);
+        }
+    }
 }
 
 /// Increment the persisted failed-unlock counter and, once it reaches
@@ -1698,6 +1743,7 @@ mod tests {
             &restarted.paths.database,
             &restarted.paths.attempts,
             &restarted.paths.journal,
+            &restarted.paths.attachments,
         ] {
             assert!(!path.exists(), "{} must not survive a burn", path.display());
         }
@@ -1806,6 +1852,75 @@ mod tests {
             "no temp file may be left behind"
         );
         unlock_application_impl(PASSPHRASE.to_owned(), &restarted).expect("unlock after restart");
+    }
+
+    #[test]
+    fn burn_identity_removes_the_simplex_store_and_attachment_objects() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        let store = AttachmentStore::open(&runtime.paths.attachments).expect("store");
+        store.ingest("x/y", 1, b"z".as_slice()).expect("ingest");
+        let chat_db = dir.path().join("simplex_chat.db");
+        let agent_db = dir.path().join("simplex_agent.db");
+        fs::write(&chat_db, b"ciphertext").expect("seed chat db");
+        fs::write(&agent_db, b"ciphertext").expect("seed agent db");
+
+        burn_identity_impl(None, &runtime).expect("burn");
+
+        assert!(
+            !runtime.paths.attachments.exists(),
+            "attachment objects must be removed"
+        );
+        assert!(!chat_db.exists(), "SimpleX chat store must be removed");
+        assert!(!agent_db.exists(), "SimpleX agent store must be removed");
+    }
+
+    #[test]
+    fn unlock_deletes_attachment_objects_left_behind_by_an_interrupted_conversation_burn() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime).expect("unlock");
+
+        let store = AttachmentStore::open(&runtime.paths.attachments).expect("store");
+        let object = store.ingest("x/y", 1, b"z".as_slice()).expect("ingest");
+        {
+            let mut unlocked = runtime.unlocked.lock().expect("lock");
+            let vault = &mut unlocked.as_mut().expect("unlocked").vault;
+            let conversation = vault.insert_conversation("c").expect("conversation");
+            let message = vault
+                .insert_outgoing_message(&conversation, b"ct")
+                .expect("message");
+            vault
+                .insert_attachment(
+                    &message,
+                    &object.object_name,
+                    "x/y",
+                    1,
+                    object.key.as_bytes(),
+                )
+                .expect("attachment");
+            // Keys destroyed and rows removed, but the process "dies" before deleting the file.
+            secure_storage::burn::burn_conversation(vault, &conversation).expect("burn");
+        }
+        assert!(store.root().join(&object.object_name).exists());
+        lock_application_impl(&runtime).expect("lock");
+
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime).expect("unlock again");
+
+        assert!(
+            !store.root().join(&object.object_name).exists(),
+            "ciphertext of a burned attachment must be deleted on the next unlock"
+        );
+        let unlocked = runtime.unlocked.lock().expect("lock");
+        let vault = &unlocked.as_ref().expect("unlocked").vault;
+        assert!(
+            vault
+                .pending_object_deletions()
+                .expect("pending")
+                .is_empty()
+        );
     }
 
     #[test]

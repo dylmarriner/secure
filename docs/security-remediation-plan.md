@@ -696,23 +696,23 @@ The chunked AEAD primitive correctly authenticates each chunk and detects trunca
 
 ## Work
 
-- [ ] Keep `decrypt_stream` as a low-level streaming primitive, but never use it directly with a final persistent destination in app code.
-- [ ] Add `decrypt_to_file_atomically`: create restrictive-permission sibling/temp output, decrypt completely, fsync when appropriate, then atomically rename to the user-selected destination only after final authentication succeeds.
-- [ ] Delete the temporary plaintext on any authentication/I/O failure; document SSD/filesystem limitations honestly.
-- [ ] Implement real encrypted attachment ingest using random opaque object names.
-- [ ] Persist each attachment key only inside the encrypted Secure vault.
-- [ ] Add SimpleX attachment transport references without sending original local paths.
-- [ ] Extend Burn Conversation so attachment keys are destroyed before on-disk ciphertext cleanup and cleanup resumes after crash.
-- [ ] Extend Burn Identity cleanup to include the encrypted attachment-object directory.
+- [x] Keep `decrypt_stream` as a low-level streaming primitive, but never use it directly with a final persistent destination in app code. (No app code calls it; `store::decrypt_to_file_atomically` is the export path.)
+- [x] Add `decrypt_to_file_atomically`: create restrictive-permission sibling/temp output, decrypt completely, fsync when appropriate, then atomically rename to the user-selected destination only after final authentication succeeds. (`secure-attachments/src/store.rs`: `create_new` + 0600 random-named sibling, `sync_all`, rename, fsync dir.)
+- [x] Delete the temporary plaintext on any authentication/I/O failure; document SSD/filesystem limitations honestly. (Module docs state that unlinked blocks may remain recoverable.)
+- [x] Implement real encrypted attachment ingest using random opaque object names. (`AttachmentStore::ingest`: fresh key + 128-bit random name, written to a hidden `.partial` then renamed; names are validated on every path build so a stored name cannot escape the directory. No UI caller yet - the desktop UI has no conversation/attachment screens.)
+- [x] Persist each attachment key only inside the encrypted Secure vault. (`Vault::insert_attachment` / `Vault::attachment`; keys read back as `Zeroizing`.)
+- [ ] Add SimpleX attachment transport references without sending original local paths. Open: needs SimpleX file-transfer commands exercised against the live native core, which this environment cannot build.
+- [x] Extend Burn Conversation so attachment keys are destroyed before on-disk ciphertext cleanup and cleanup resumes after crash. (The key-destruction stage queues object names in `pending_object_deletions` (migration 0004) in the same transaction; the desktop runtime deletes queued objects and resumes incomplete conversation burns on every unlock - the latter was previously never called by the host.)
+- [x] Extend Burn Identity cleanup to include the encrypted attachment-object directory. (`DataCleanupFinished` now also removes the attachment directory and the normal SimpleX store, which was previously left on disk.)
 
 ## Required tests
 
-- [ ] tampered/truncated ciphertext never publishes the final plaintext path.
-- [ ] failed export removes the temporary plaintext path.
-- [ ] original filename does not appear in encrypted object names.
-- [ ] attachment key exists only in encrypted vault storage.
-- [ ] Burn Conversation destroys key before ciphertext cleanup.
-- [ ] crash after key destruction but before object deletion resumes cleanup safely.
+- [x] tampered/truncated ciphertext never publishes the final plaintext path. (`tampered_ciphertext_never_publishes_the_final_plaintext_path`, `truncated_ciphertext_never_publishes_and_removes_its_temporary_plaintext`.)
+- [x] failed export removes the temporary plaintext path. (Same tests, plus `failed_export_leaves_an_existing_destination_untouched`.)
+- [x] original filename does not appear in encrypted object names. (`original_filename_does_not_appear_in_encrypted_object_names`.)
+- [x] attachment key exists only in encrypted vault storage. (`attachment_key_exists_only_in_encrypted_vault_storage` scans the raw vault file.)
+- [x] Burn Conversation destroys key before ciphertext cleanup. (`burn_queues_attachment_objects_for_deletion_and_destroys_their_keys`.)
+- [x] crash after key destruction but before object deletion resumes cleanup safely. (`crash_after_key_destruction_keeps_the_object_queued_for_cleanup`; desktop `unlock_deletes_attachment_objects_left_behind_by_an_interrupted_conversation_burn`.)
 
 ## Exit criteria
 
