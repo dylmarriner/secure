@@ -335,10 +335,13 @@ impl AppRuntime {
             // advertising that an identity was burned here.
             perform_destruction_step(DestructionEvent::DataCleanupFinished, self);
             destruction_journal::clear(&self.paths.journal);
+            let _ = enter_fresh_provisioning(&mut lifecycle);
             return;
         }
 
-        let _ = destroy_identity_locked(&mut lifecycle, self);
+        if destroy_identity_locked(&mut lifecycle, self).is_ok() {
+            let _ = enter_fresh_provisioning(&mut lifecycle);
+        }
     }
 }
 
@@ -546,6 +549,19 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
             let _ = AttachmentStore::destroy_all(&runtime.paths.attachments);
         }
     }
+}
+
+/// After a completed burn, move straight to fresh provisioning (onboarding a brand-new identity)
+/// instead of stopping at the terminal `Destroyed` state. `docs/self-destruct-semantics.md`
+/// requires Secure to return to a clean, usable state after Burn and, if anything interrupts
+/// replacement, to resume *fresh* provisioning - never a dead end that needs a restart, and never
+/// the old identity. The destroyed lifecycle is replaced, not reopened: this is exactly what a
+/// relaunch over the now-empty data directory produces.
+fn enter_fresh_provisioning(lifecycle: &mut AppLifecycle) -> Result<(), String> {
+    *lifecycle = AppLifecycle::new(AppState::Starting);
+    lifecycle
+        .apply(AppEvent::NeedsOnboarding)
+        .map_err(|error| error.to_string())
 }
 
 /// Start a new Burn Identity: durably arm the journal, then move the lifecycle to `Destroying`,
@@ -792,7 +808,7 @@ fn record_failed_unlock_attempt(lifecycle: &mut AppLifecycle, runtime: &AppRunti
     // Threshold reached: this is no longer a normal unlock failure, it is the failsafe firing.
     let begin_result = begin_identity_burn(lifecycle, runtime);
 
-    match begin_result {
+    match begin_result.and_then(|()| enter_fresh_provisioning(lifecycle)) {
         Ok(()) => format!(
             "too many incorrect passphrase attempts ({attempts} of {MAX_FAILED_UNLOCK_ATTEMPTS}) \
              - all local vault data has been permanently destroyed"
@@ -1009,23 +1025,28 @@ pub(crate) fn burn_identity_impl(
 
     // Destruction is complete and the journal is cleared. Only now is it safe to provision a
     // replacement - see this function's docs for why this cannot be a destruction stage.
-    if let Some(passphrase) = replacement_passphrase {
-        debug_assert_eq!(lifecycle.state(), AppState::Destroyed);
-        provision_new_vault(&passphrase, runtime).map_err(|error| {
-            format!(
-                "the previous identity was destroyed successfully, but the replacement could \
-                 not be created ({error}) - restart Secure to set one up"
-            )
-        })?;
+    match replacement_passphrase {
+        Some(passphrase) => {
+            debug_assert_eq!(lifecycle.state(), AppState::Destroyed);
+            if let Err(error) = provision_new_vault(&passphrase, runtime) {
+                // The old identity stays destroyed; resume fresh provisioning rather than leave a
+                // dead end (self-destruct-semantics.md invariant 9).
+                enter_fresh_provisioning(&mut lifecycle)?;
+                return Err(format!(
+                    "the previous identity was destroyed successfully, but the replacement could \
+                     not be created ({error}) - create a new identity to continue"
+                ));
+            }
 
-        // The lifecycle is terminal at `Destroyed` by design, and stays that way: nothing
-        // reopens the destroyed identity. What happens here is that the runtime adopts a fresh
-        // lifecycle over a data directory that now contains a different vault entirely - which
-        // is precisely, and only, what a relaunch of the application would do at this point.
-        *lifecycle = AppLifecycle::new(AppState::Starting);
-        lifecycle
-            .apply(AppEvent::ExistingVault)
-            .map_err(|error| error.to_string())?;
+            // The destroyed lifecycle is never reopened: the runtime adopts a fresh lifecycle
+            // over a data directory that now contains a different vault entirely - precisely
+            // what a relaunch would do at this point.
+            *lifecycle = AppLifecycle::new(AppState::Starting);
+            lifecycle
+                .apply(AppEvent::ExistingVault)
+                .map_err(|error| error.to_string())?;
+        }
+        None => enter_fresh_provisioning(&mut lifecycle)?,
     }
 
     Ok(status_for(lifecycle.state()))
@@ -1524,7 +1545,7 @@ mod tests {
         assert!(error.contains("3 of 3"));
 
         let status = app_status_impl(&runtime).expect("status");
-        assert_eq!(status.state, "destroyed");
+        assert_eq!(status.state, "onboarding");
 
         assert!(
             !runtime.paths.envelope.exists(),
@@ -1674,7 +1695,7 @@ mod tests {
             let status = app_status_impl(&restarted).expect("status");
 
             assert_eq!(
-                status.state, "destroyed",
+                status.state, "onboarding",
                 "a burn interrupted at {stage:?} must resume to Destroyed, not offer an unlock"
             );
             assert!(
@@ -1725,7 +1746,7 @@ mod tests {
         let restarted = runtime_in(dir.path());
         assert_eq!(
             app_status_impl(&restarted).expect("status").state,
-            "destroyed"
+            "onboarding"
         );
         assert!(!restarted.paths.envelope.exists());
     }
@@ -1752,7 +1773,7 @@ mod tests {
         let restarted = runtime_in(dir.path());
         assert_eq!(
             app_status_impl(&restarted).expect("status").state,
-            "destroyed"
+            "onboarding"
         );
         assert!(!restarted.paths.journal.exists());
         assert!(!restarted.paths.database.exists());
@@ -1773,7 +1794,7 @@ mod tests {
         let restarted = runtime_in(dir.path());
         assert_eq!(
             app_status_impl(&restarted).expect("status").state,
-            "destroyed",
+            "onboarding",
             "a damaged journal must still resume the burn"
         );
         assert!(!restarted.paths.envelope.exists());
@@ -1889,7 +1910,7 @@ mod tests {
         let restarted = runtime_in(dir.path());
         assert_eq!(
             app_status_impl(&restarted).expect("status").state,
-            "destroyed"
+            "onboarding"
         );
         assert!(!restarted.paths.envelope.exists());
         assert!(!restarted.paths.database.exists());
@@ -2018,6 +2039,51 @@ mod tests {
         );
     }
 
+    /// `docs/self-destruct-semantics.md` invariant 5, verbatim. Restoring a pre-burn copy of the
+    /// application-data directory must not resurrect the burned identity, even with its correct
+    /// passphrase. This FAILS today: every secret the identity needs lives in the data directory,
+    /// so the copy is sufficient. Making it pass requires device-bound anti-rollback state that is
+    /// not stored there (`docs/backup-snapshot-hardening.md`) - a platform primitive (e.g. a TPM
+    /// NV monotonic counter) and a reviewed key-combining design that have not been chosen yet.
+    /// Kept as an executable release blocker; `docs/release-checklist.md` section 4.
+    #[test]
+    #[ignore = "RELEASE BLOCKER: device-bound anti-rollback state is not implemented yet"]
+    fn restoring_a_pre_burn_copy_cannot_resurrect_the_burned_identity() {
+        fn copy_dir(from: &Path, to: &Path) {
+            fs::create_dir_all(to).expect("mkdir");
+            for entry in fs::read_dir(from).expect("read dir").flatten() {
+                let target = to.join(entry.file_name());
+                if entry.file_type().expect("type").is_dir() {
+                    copy_dir(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), &target).expect("copy");
+                }
+            }
+        }
+        let root = tempfile::tempdir().expect("tempdir");
+        let data = root.path().join("data");
+        let snapshot = root.path().join("snapshot");
+        fs::create_dir(&data).expect("mkdir");
+
+        let runtime = runtime_in(&data);
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("identity A");
+        drop(runtime);
+        copy_dir(&data, &snapshot);
+
+        let runtime = runtime_in(&data);
+        burn_identity_impl(Some(REPLACEMENT_PASSPHRASE.to_owned()), &runtime)
+            .expect("burn A, replace with B");
+        drop(runtime);
+
+        fs::remove_dir_all(&data).expect("remove current data");
+        copy_dir(&snapshot, &data);
+        let restored = runtime_in(&data);
+        assert!(
+            unlock_application_impl(PASSPHRASE.to_owned(), &restored).is_err(),
+            "a pre-burn snapshot plus the old passphrase must not recover identity A"
+        );
+    }
+
     #[test]
     fn burn_identity_destroys_an_unlocked_vault_on_request() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2027,7 +2093,7 @@ mod tests {
 
         let status = burn_identity_impl(None, &runtime).expect("burn from Unlocked");
 
-        assert_eq!(status.state, "destroyed");
+        assert_eq!(status.state, "onboarding");
         assert!(!runtime.paths.envelope.exists());
         assert!(!runtime.paths.database.exists());
         // The open vault handle and vault master key must have been dropped, not merely
@@ -2048,20 +2114,35 @@ mod tests {
 
         let status = burn_identity_impl(None, &runtime).expect("burn from Locked");
 
-        assert_eq!(status.state, "destroyed");
+        assert_eq!(status.state, "onboarding");
         assert!(!runtime.paths.envelope.exists());
     }
 
     #[test]
-    fn burning_an_already_destroyed_identity_is_idempotent() {
+    fn burn_leaves_the_application_ready_for_a_fresh_identity_not_a_dead_end() {
+        // self-destruct-semantics.md: after Burn, Secure returns to a clean usable state. With
+        // no replacement passphrase supplied, that is fresh provisioning - not a terminal state
+        // that needs a restart, and never the old identity.
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = runtime_in(dir.path());
         complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
 
-        burn_identity_impl(None, &runtime).expect("first burn");
-        let status = burn_identity_impl(None, &runtime).expect("second burn must not error");
+        let status = burn_identity_impl(None, &runtime).expect("burn");
+        assert_eq!(status.state, "onboarding");
 
-        assert_eq!(status.state, "destroyed");
+        // There is no identity left to burn, so a second request destroys nothing.
+        assert!(burn_identity_impl(None, &runtime).is_err());
+
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect("a fresh identity can be created in the same session");
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect("the fresh identity unlocks with its own passphrase");
+        let unlocked = runtime.unlocked.lock().expect("lock");
+        let vault = &unlocked.as_ref().expect("unlocked").vault;
+        assert!(
+            vault.pending_object_deletions().expect("queue").is_empty(),
+            "nothing from the destroyed identity carries over"
+        );
     }
 
     const REPLACEMENT_PASSPHRASE: &str = "an entirely different passphrase";
@@ -2356,7 +2437,7 @@ mod tests {
         assert!(runtime.ghost.lock().unwrap().is_some());
 
         let status = burn_identity_impl(None, &runtime).expect("burn from ghost");
-        assert_eq!(status.state, "destroyed");
+        assert_eq!(status.state, "onboarding");
         assert!(
             runtime.ghost.lock().unwrap().is_none(),
             "burning identity must also clear an active ghost session's key"
