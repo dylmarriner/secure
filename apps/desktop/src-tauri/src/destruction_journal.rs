@@ -315,4 +315,22 @@ mod tests {
             );
         }
     }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Whatever bytes end up in an existing journal file - torn write, corruption, tampering -
+        /// it must read back as a pending burn (never `None`, which would cancel it) and never
+        /// panic. The fail-closed property `a_corrupt_journal_still_means_a_burn_is_pending`
+        /// checks for a handful of shapes, generalised.
+        #[test]
+        fn any_existing_journal_reads_as_a_pending_burn(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = journal_in(dir.path());
+            fs::write(&path, &bytes).expect("write");
+            proptest::prop_assert!(read_stage(&path).is_some());
+        }
+    }
 }

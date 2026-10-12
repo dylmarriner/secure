@@ -816,8 +816,8 @@ A merge to `main` cannot bypass required platform/security checks through the no
 
 ## Work
 
-- [ ] Fuzz persistent parsers: `SVK1`, `SATT`, destruction journal, SimpleX event parsing, migration inputs where practical.
-- [ ] Fault-inject crashes/power-loss equivalents across Burn Conversation and Burn Identity stages.
+- [x] Fuzz persistent parsers: `SVK1`, `SATT`, destruction journal, SimpleX event parsing, migration inputs where practical. (Stable property tests in every CI build: `any_single_byte_change_to_an_envelope_is_rejected`, `any_single_byte_change_is_rejected`, `any_truncation_is_rejected`, `event_parsing_never_panics`, `an_accepted_link_is_exactly_one_command_argument`, `any_existing_journal_reads_as_a_pending_burn`. Coverage-guided `cargo-fuzz` harnesses in `fuzz/` run weekly in `integration-security.yml`. Migrations are fixed SQL with no untrusted input, so they are not fuzzed.)
+- [ ] Fault-inject crashes/power-loss equivalents across Burn Conversation and Burn Identity stages. In-process crash injection at every stage is covered (`a_burn_interrupted_at_any_stage_resumes_forward_to_destroyed_on_restart`, `failed_stage_journal_write_is_replayed_after_restart`, `crash_after_key_destruction_keeps_the_object_queued_for_cleanup`); real power-loss on real hardware is still open (`docs/release-checklist.md` section 3).
 - [ ] Packet-capture Tor/SimpleX workflows for direct DNS/relay leakage.
 - [ ] Exercise fresh install, upgrade/migration, lock/unlock, Tor failure, offline delivery, burn, Ghost, and attachment workflows on real Windows and Linux machines.
 - [ ] Verify installer/uninstaller behaviour and application-data locations.
