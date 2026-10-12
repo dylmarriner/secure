@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 ///
 /// Persistent formats are versioned per the project engineering rules: bumping this value
 /// must be paired with a new entry in [`migrations::MIGRATIONS`].
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -39,10 +39,28 @@ pub enum StorageError {
     MigrationFailed { version: i64 },
     #[error("no conversation exists with the requested id")]
     ConversationNotFound,
+    #[error("no attachment exists with the requested id, or its key has been destroyed")]
+    AttachmentNotFound,
     #[error("destruction tombstone has an unrecognised stage value: {value}")]
     CorruptDestructionStage { value: String },
     #[error("sqlite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
+}
+
+/// An attachment's on-disk object name and its independent key, as read back from the vault.
+pub struct StoredAttachment {
+    pub object_name: String,
+    pub content_type: Option<String>,
+    pub key: Zeroizing<[u8; 32]>,
+}
+
+impl fmt::Debug for StoredAttachment {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StoredAttachment")
+            .field("object_name", &self.object_name)
+            .field("content_type", &self.content_type)
+            .finish_non_exhaustive()
+    }
 }
 
 /// A handle to an open encrypted vault database.
@@ -95,6 +113,54 @@ impl Vault {
         ciphertext: &[u8],
     ) -> Result<String, StorageError> {
         schema::insert_message_with_direction(self, conversation_id, ciphertext, "outgoing")
+    }
+
+    /// Record an encrypted attachment object for `message_id`. `attachment_key` is the object's
+    /// independent random key; this vault is the only place it is ever persisted.
+    pub fn insert_attachment(
+        &mut self,
+        message_id: &str,
+        object_name: &str,
+        content_type: &str,
+        expected_size_bytes: u64,
+        attachment_key: &[u8; 32],
+    ) -> Result<String, StorageError> {
+        schema::insert_attachment(
+            self,
+            message_id,
+            object_name,
+            content_type,
+            expected_size_bytes,
+            attachment_key,
+        )
+    }
+
+    /// Look up an attachment's object name and key. A burned attachment (key destroyed, or row
+    /// already removed) is [`StorageError::AttachmentNotFound`].
+    pub fn attachment(&self, attachment_id: &str) -> Result<StoredAttachment, StorageError> {
+        schema::attachment(self, attachment_id)
+    }
+
+    /// Opaque names of encrypted attachment objects whose keys a burn has already destroyed and
+    /// whose on-disk ciphertext still has to be deleted. See [`burn`] and
+    /// [`Self::acknowledge_object_deleted`].
+    pub fn pending_object_deletions(&self) -> Result<Vec<String>, StorageError> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT object_name FROM pending_object_deletions ORDER BY object_name;")?;
+        let names = statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<String>, _>>()?;
+        Ok(names)
+    }
+
+    /// Record that a queued object's file is gone. Idempotent.
+    pub fn acknowledge_object_deleted(&mut self, object_name: &str) -> Result<(), StorageError> {
+        self.conn.execute(
+            "DELETE FROM pending_object_deletions WHERE object_name = ?1;",
+            rusqlite::params![object_name],
+        )?;
+        Ok(())
     }
 
     /// Create a brand-new encrypted vault at `path`.
@@ -415,10 +481,11 @@ mod tests {
         vault
             .connection_mut()
             .execute_batch(
-                "DROP INDEX contacts_external_id_idx; \
+                "DROP TABLE pending_object_deletions; \
+                 DROP INDEX contacts_external_id_idx; \
                  ALTER TABLE contacts DROP COLUMN external_id;",
             )
-            .expect("drop 0003 objects");
+            .expect("drop 0003/0004 objects");
         vault
             .connection_mut()
             .pragma_update(None, "user_version", 2)
@@ -493,5 +560,37 @@ mod tests {
         haystack
             .windows(needle.len())
             .any(|window| window == needle)
+    }
+    #[test]
+    fn attachment_key_exists_only_in_encrypted_vault_storage() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("vault.db");
+        let mut vault = Vault::create_new(&path, &key()).expect("create");
+        let conversation_id = vault.insert_conversation("c").expect("conversation");
+        let message_id = vault
+            .insert_outgoing_message(&conversation_id, b"ct")
+            .expect("message");
+        let attachment_key = *b"ATTACHMENT-KEY-MARKER-32-BYTES!!";
+        let id = vault
+            .insert_attachment(
+                &message_id,
+                "0123456789abcdef0123456789abcdef",
+                "x/y",
+                1,
+                &attachment_key,
+            )
+            .expect("attachment");
+        assert_eq!(
+            vault.attachment(&id).expect("lookup").key.as_slice(),
+            attachment_key.as_slice()
+        );
+        drop(vault);
+
+        let raw = std::fs::read(&path).expect("read raw db");
+        assert!(
+            !raw.windows(attachment_key.len())
+                .any(|window| window == attachment_key.as_slice()),
+            "attachment key must never appear in the vault file in plaintext"
+        );
     }
 }

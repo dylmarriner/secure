@@ -1,0 +1,42 @@
+# Coverage-guided fuzzing of Secure's persistent/untrusted parsers (docs/security-remediation-plan.md
+# R9). Needs nightly + cargo-fuzz:  cargo +nightly fuzz run <target>
+# Not part of the main workspace; the stable property tests in each crate run in CI instead.
+[package]
+name = "secure-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+secure-attachments = { path = "../crates/secure-attachments" }
+secure-crypto = { path = "../crates/secure-crypto" }
+secure-messaging = { path = "../crates/secure-messaging" }
+serde_json = "1"
+
+[workspace]
+
+[[bin]]
+name = "svk1_envelope"
+path = "fuzz_targets/svk1_envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "satt_decrypt"
+path = "fuzz_targets/satt_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "simplex_events"
+path = "fuzz_targets/simplex_events.rs"
+test = false
+doc = false
+bench = false

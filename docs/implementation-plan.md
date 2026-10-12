@@ -2,6 +2,13 @@
 
 This document is the execution roadmap for Secure. It is deliberately versioned in the repository so architecture, implementation status, security gates and unresolved decisions evolve with the code instead of living in chat history.
 
+> **Active remediation gate.** Before any phase below is treated as production-capable, the
+> security remediation phases in [`docs/security-remediation-plan.md`](security-remediation-plan.md)
+> apply. Host-level messaging wiring depends on Phases R1-R4 being complete; a public beta
+> depends on R5-R8; any production security claim depends on R9 and the release checklist in
+> [`docs/release-checklist.md`](release-checklist.md). Where this roadmap and the remediation
+> plan disagree about status, the remediation plan and CI's `remediation-gate` job win.
+
 The governing security model is `docs/security-architecture.md`. If this roadmap and the security architecture ever conflict, the security architecture wins until both are deliberately reconciled in the same pull request.
 
 ## Goal

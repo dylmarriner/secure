@@ -1,0 +1,61 @@
+# Supply-chain policy (docs/security-remediation-plan.md Phase R8).
+#
+# Exceptions are reviewed changes to this file: every `ignore`/`skip`/extra license needs a
+# comment saying why it is acceptable and when it should be revisited.
+
+[graph]
+all-features = false
+
+[advisories]
+# Fail on any RustSec vulnerability. "Unmaintained" fails only for crates this repository
+# depends on directly; transitive unmaintained crates (today: `paste`, `proc-macro-error`,
+# `unic-*` - build-time proc-macro/Unicode helpers under Arti, Tauri and gtk-rs, none with a
+# known vulnerability) are tracked through upstream upgrades rather than blocking CI.
+version = 2
+yanked = "deny"
+unmaintained = "workspace"
+ignore = [
+    # Marvin timing attack on RSA *decryption/private-key* operations; no patched release exists.
+    # `rsa` reaches us only via Arti's keystore (`ssh-key-fork-arti` <- `tor-key-forge`). A Tor
+    # client never performs RSA private-key decryption, so the vulnerable operation is not
+    # reachable. Revisit when `rsa` ships a fix or on any Arti upgrade.
+    { id = "RUSTSEC-2023-0071", reason = "RSA private-key decryption is never performed by an Arti client" },
+    # quick-xml quadratic duplicate-attribute check / unbounded namespace allocation. Reaches the
+    # desktop tree only via `plist` <- `tauri-utils`, which parses developer-controlled bundle
+    # configuration at build time, never untrusted input. `plist` pins quick-xml ^0.38, so no
+    # compatible upgrade exists yet. Revisit on any Tauri upgrade.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml only parses developer-controlled Tauri bundle config" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml only parses developer-controlled Tauri bundle config" },
+]
+
+[licenses]
+version = 2
+# Every license here must be compatible with distributing the client under AGPL-3.0-or-later.
+allow = [
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+unused-allowed-license = "allow"
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

@@ -44,7 +44,7 @@ pub fn show_active_user() -> String {
 /// creates the profile before the WebSocket API is available. The native core has no equivalent
 /// launch option, so its bootstrap path must create the profile after `/_start` reports
 /// `noActiveUser`.
-#[cfg(feature = "simplex-native")]
+#[cfg(any(test, feature = "simplex-native"))]
 pub fn create_native_user() -> String {
     "/_create user {\"profile\":{\"displayName\":\"Secure\",\"fullName\":\"\"},\"pastTimestamp\":false,\"userChatRelay\":false,\"clientService\":false}".to_owned()
 }
@@ -57,10 +57,58 @@ pub fn create_invitation(user_id: i64) -> String {
     format!("/_connect {user_id}")
 }
 
+/// Longest link [`connect_via_link`] accepts. Upstream full invitation links carry several
+/// base64url-encoded keys (post-quantum included) and run to a few KiB; this leaves headroom
+/// for that while refusing to forward megabytes of pasted text into the core.
+pub const MAX_LINK_LEN: usize = 8 * 1024;
+
+/// Why a contact link was refused before any command was built from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidLink {
+    #[error("link is empty")]
+    Empty,
+    #[error("link is longer than {MAX_LINK_LEN} bytes")]
+    TooLong,
+    #[error("link must start with `simplex:` or `https://`")]
+    UnsupportedScheme,
+    #[error("link contains whitespace, control or non-ASCII characters")]
+    ForbiddenCharacter,
+}
+
+/// Validate an untrusted contact link before it is interpolated into a command string
+/// (`docs/security-remediation-plan.md` Phase R7). `APIConnect` has no structured (JSON)
+/// encoding upstream - the link is a positional argument in the command text - so the only way
+/// to rule out argument/command injection is to constrain the link itself: SimpleX links are
+/// URL-encoded and never legitimately contain spaces, control characters (NUL/CR/LF) or
+/// non-ASCII, so restricting to printable non-space ASCII leaves no separator a link could use
+/// to smuggle a second argument or command. Self-hosted relays mean the `https://` host cannot
+/// be pinned to `simplex.chat`.
+pub fn validate_link(link: &str) -> Result<(), InvalidLink> {
+    if link.is_empty() {
+        return Err(InvalidLink::Empty);
+    }
+    if link.len() > MAX_LINK_LEN {
+        return Err(InvalidLink::TooLong);
+    }
+    if !link.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(InvalidLink::ForbiddenCharacter);
+    }
+    let lower = link
+        .get(..8)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if !(lower.starts_with("simplex:") || lower.starts_with("https://")) {
+        return Err(InvalidLink::UnsupportedScheme);
+    }
+    Ok(())
+}
+
 /// `/_connect <userId> <preparedLink>` - `APIConnect`: connect using a prepared SimpleX link
-/// (one-time invitation, contact address, or group link).
-pub fn connect_via_link(user_id: i64, link: &str) -> String {
-    format!("/_connect {user_id} {link}")
+/// (one-time invitation, contact address, or group link). The link is untrusted input and is
+/// checked by [`validate_link`] first.
+pub fn connect_via_link(user_id: i64, link: &str) -> Result<String, InvalidLink> {
+    validate_link(link)?;
+    Ok(format!("/_connect {user_id} {link}"))
 }
 
 /// Which kind of chat a `ChatRef` identifies. `ChatType` (the upstream type this mirrors) has
@@ -223,7 +271,14 @@ impl NetworkConfig {
             socks_mode: "always",
             host_mode: "public",
             required_host_mode: true,
-            session_mode: "user",
+            // `entity`, not upstream's app default: simplexmq's `clientSocksCredentials` (pinned
+            // commit) derives the SOCKS username from the session mode, and with no auth prefix
+            // (`SocksIsolateByAuth`) that username is what `TorSocksProxy`'s per-credential
+            // isolation keys circuits on. `user` hashes only the user id - every relay
+            // connection shares one circuit; `entity` adds the server and connection id, so each
+            // contact's connection gets its own. Costs more TCP sessions/circuits; for a
+            // security-first client unlinkability across contacts is worth that.
+            session_mode: "entity",
             smp_proxy_mode: "always",
             smp_proxy_fallback: "allowProtected",
             smp_web_port_servers: "preset",
@@ -291,9 +346,54 @@ mod tests {
     #[test]
     fn connect_via_link_matches_documented_syntax() {
         assert_eq!(
-            connect_via_link(1, "https://simplex.chat/invitation#/?v=1&smp=..."),
-            "/_connect 1 https://simplex.chat/invitation#/?v=1&smp=..."
+            connect_via_link(1, "https://simplex.chat/invitation#/?v=1&smp=...").as_deref(),
+            Ok("/_connect 1 https://simplex.chat/invitation#/?v=1&smp=...")
         );
+    }
+
+    #[test]
+    fn connect_via_link_accepts_the_simplex_scheme() {
+        assert!(connect_via_link(1, "simplex:/invitation#/?v=2-7&smp=smp%3A%2F%2Fabc").is_ok());
+    }
+
+    #[test]
+    fn malicious_links_with_newline_or_control_characters_are_rejected_before_send() {
+        for link in [
+            "https://simplex.chat/invitation#x\n/_send @1 json []",
+            "https://simplex.chat/invitation#x\r/_delete @1",
+            "https://simplex.chat/invitation#x\0",
+            "https://simplex.chat/invitation#x\t",
+            "https://simplex.chat/invitation#x /_send @1 text hi",
+            "https://simplex.chat/invitation#\u{2028}",
+        ] {
+            assert_eq!(
+                connect_via_link(1, link),
+                Err(InvalidLink::ForbiddenCharacter),
+                "{link:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn links_with_other_schemes_are_rejected() {
+        for link in [
+            "http://simplex.chat/x",
+            "file:///etc/passwd",
+            "/_send",
+            "javascript:x",
+        ] {
+            assert_eq!(
+                connect_via_link(1, link),
+                Err(InvalidLink::UnsupportedScheme)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_and_oversized_links_are_rejected() {
+        assert_eq!(connect_via_link(1, ""), Err(InvalidLink::Empty));
+        let long = format!("https://{}", "a".repeat(MAX_LINK_LEN));
+        assert_eq!(connect_via_link(1, &long), Err(InvalidLink::TooLong));
     }
 
     #[test]
@@ -347,6 +447,17 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(json_part).expect("payload must be valid JSON");
         assert_eq!(payload["socksProxy"], "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn set_network_config_isolates_circuits_per_connection() {
+        let address: SocketAddrV4 = "127.0.0.1:9999".parse().expect("valid address");
+        let command = set_network_config(address);
+        let payload: serde_json::Value =
+            serde_json::from_str(command.strip_prefix("/_network ").expect("prefix"))
+                .expect("payload must be valid JSON");
+        assert_eq!(payload["sessionMode"], "entity");
+        assert_eq!(payload["socksMode"], "always");
     }
 
     #[test]

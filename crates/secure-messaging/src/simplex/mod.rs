@@ -22,6 +22,8 @@
 //! does exactly that, built from source by `scripts/build-simplex-native.sh`.
 
 pub(crate) mod adapter;
+#[cfg(any(test, feature = "simplex-native"))]
+pub(crate) mod bootstrap;
 pub(crate) mod client;
 pub(crate) mod commands;
 #[cfg(feature = "simplex-native")]
@@ -29,4 +31,6 @@ pub(crate) mod core;
 pub(crate) mod events;
 #[cfg(feature = "simplex-native")]
 pub(crate) mod native_adapter;
+#[cfg(test)]
+mod properties;
 pub(crate) mod protocol;

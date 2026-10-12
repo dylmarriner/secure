@@ -174,7 +174,7 @@ async function burnIdentity(event) {
     renderStatus(status);
     message.textContent = replacement
       ? "Previous identity destroyed. A new, unrelated vault is now in its place - unlock it with its own passphrase."
-      : "Identity destroyed. The vault key no longer exists.";
+      : "Identity destroyed. The vault key no longer exists. Create a new, unrelated identity to continue.";
   } catch (error) {
     resetBurnConfirmation();
     message.textContent = String(error);

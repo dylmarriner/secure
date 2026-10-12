@@ -25,14 +25,13 @@
 //!
 //! # Scope
 //!
-//! This crate provides the encryption/decryption primitives and opaque object naming only. It
-//! does not touch the filesystem beyond what the caller's `Read`/`Write` do, does not persist
-//! attachment keys (that is `secure-storage`'s `attachments.attachment_key` column, already
-//! part of the Phase 1 schema), does not generate thumbnails, and does not integrate with
-//! conversation/identity burn beyond what `secure-storage::burn` already does at the database
-//! row level (destroying `attachment_key` values) - deleting the on-disk ciphertext object
-//! itself, once this crate's `random_object_name` naming convention is actually wired into a
-//! real ingest path, is separate follow-up work. See `docs/implementation-plan.md` Phase 4.
+//! This crate provides the encryption/decryption primitives, opaque object naming, and the
+//! on-disk object store with transactional export ([`store`]). It does not persist attachment
+//! keys (that is `secure-storage`'s `attachments.attachment_key` column) and does not generate
+//! thumbnails. Burn integration is split by ownership: `secure-storage::burn` destroys the keys
+//! and durably queues the object names in the same transaction; the desktop runtime then deletes
+//! those objects through [`store::AttachmentStore::remove_object`] and acknowledges each one, so
+//! cleanup resumes after a crash. See `docs/security-remediation-plan.md` Phase R6.
 
 use std::io::{self, Read, Write};
 
@@ -43,6 +42,8 @@ use chacha20poly1305::aead::{KeyInit, Payload};
 use rand_core::{OsRng, RngCore};
 use thiserror::Error;
 use zeroize::Zeroizing;
+
+pub mod store;
 
 const KEY_LEN: usize = 32;
 const MAGIC: &[u8; 4] = b"SATT";
@@ -70,6 +71,10 @@ pub enum AttachmentError {
     Encryption,
     #[error("attachment authentication failed: ciphertext is corrupt, tampered with, or truncated")]
     Decryption,
+    #[error("object name is not a valid opaque attachment name")]
+    InvalidObjectName,
+    #[error("export destination must name a file")]
+    InvalidDestination,
     #[error("i/o error: {0}")]
     Io(#[from] io::Error),
 }

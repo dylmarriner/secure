@@ -157,7 +157,14 @@ impl SimplexCore {
 
         let prefix = db_file_prefix.to_str().ok_or(CoreError::InvalidPath)?;
         let prefix = cstring(prefix, CoreError::InvalidPath)?;
-        let key = cstring(key.as_str(), CoreError::InvalidKey)?;
+        // Not `CString::new`: that copy would outlive this call un-wiped (and may reallocate to
+        // append the NUL, leaving a second copy behind). One exact-capacity buffer, zeroed on drop.
+        if key.as_bytes().contains(&0) {
+            return Err(CoreError::InvalidKey);
+        }
+        let mut key_c = Zeroizing::new(Vec::with_capacity(key.len() + 1));
+        key_c.extend_from_slice(key.as_bytes());
+        key_c.push(0);
         // "yesUp" (`MCYesUp`): apply forward schema migrations automatically rather than
         // blocking on an interactive confirmation this process has no console for - the same
         // choice upstream's own `defaultMobileConfig` makes for mobile/desktop clients.
@@ -167,7 +174,7 @@ impl SimplexCore {
         let response = unsafe {
             chat_migrate_init_key(
                 prefix.as_ptr(),
-                key.as_ptr(),
+                key_c.as_ptr().cast::<c_char>(),
                 0, // keep_key: false - the native core need not retain the key past opening.
                 confirm.as_ptr(),
                 0, // background: false - this is a foreground open, not a background migration.

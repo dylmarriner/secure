@@ -141,10 +141,10 @@ pub fn clear(path: &Path) {
 
 /// Write `bytes` to `path` atomically *and* durably: temp file, fsync the temp file's contents,
 /// rename into place, then fsync the containing directory so the rename itself survives a power
-/// loss. [`crate::write_file_atomically`] guarantees only that a reader never sees a torn file;
-/// this additionally guarantees the result is still there after the machine loses power, which
+/// loss. Atomic rename alone guarantees only that a reader never sees a torn file; this
+/// additionally guarantees the result is still there after the machine loses power, which
 /// is the property a destruction journal actually depends on.
-fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // Validated up front so a path with no parent fails here rather than half-way through,
     // after a temp file has already been created somewhere unexpected.
     path.parent().ok_or_else(|| {
@@ -313,6 +313,24 @@ mod tests {
                 Some(stage),
                 "{stage:?} does not round-trip through its on-disk name"
             );
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(512))]
+
+        /// Whatever bytes end up in an existing journal file - torn write, corruption, tampering -
+        /// it must read back as a pending burn (never `None`, which would cancel it) and never
+        /// panic. The fail-closed property `a_corrupt_journal_still_means_a_burn_is_pending`
+        /// checks for a handful of shapes, generalised.
+        #[test]
+        fn any_existing_journal_reads_as_a_pending_burn(
+            bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+        ) {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = journal_in(dir.path());
+            fs::write(&path, &bytes).expect("write");
+            proptest::prop_assert!(read_stage(&path).is_some());
         }
     }
 }

@@ -10,6 +10,18 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Every third-party action is pinned to a full commit SHA (docs/security-remediation-plan.md R8);
+# the trailing comment names the release it was resolved from. Dependabot's github-actions
+# updates keep these current - review the upstream diff before merging one.
+#
+# `--all-features` enables `simplex-native`, whose 233MB native core is not available on hosted
+# runners. SECURE_SIMPLEX_NATIVE_CHECK_ONLY=1 lets clippy type-check that code without linking
+# it; it must never be set on a step that builds or runs a binary.
+
 jobs:
   rust-core:
     name: Rust core (${{ matrix.os }})
@@ -19,68 +31,154 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install NASM (Windows, required to build vendored OpenSSL for SQLCipher)
         if: ${{ runner.os == 'Windows' }}
-        uses: ilammy/setup-nasm@v1
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - name: Install tpm2-tss (Linux, for secure-device's tpm feature under --all-features)
+        if: ${{ runner.os == 'Linux' }}
+        run: sudo apt-get update && sudo apt-get install -y libtss2-dev
       - name: Format
         run: cargo fmt --all -- --check
       - name: Test
-        run: cargo test --workspace --all-targets
+        run: cargo test --locked --workspace --all-targets
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        env:
+          SECURE_SIMPLEX_NATIVE_CHECK_ONLY: "1"
+        run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
-  desktop-check-linux:
-    name: Tauri desktop compile check (Linux)
+  # The desktop host is outside the Cargo workspace (it has its own lockfile), so its tests -
+  # Burn Identity crash recovery, lock/unlock, Ghost, attachment cleanup - only run here.
+  desktop-linux:
+    name: Tauri desktop tests (Linux)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: apps/desktop/src-tauri
-      - name: Install Linux Tauri prerequisites when desktop app exists
-        if: ${{ hashFiles('apps/desktop/src-tauri/Cargo.toml') != '' }}
+      - name: Install Linux Tauri prerequisites
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             build-essential \
-            curl \
             file \
             libayatana-appindicator3-dev \
             librsvg2-dev \
             libssl-dev \
+            libtss2-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
-            patchelf \
-            wget
-      - name: Compile desktop host when present
-        if: ${{ hashFiles('apps/desktop/src-tauri/Cargo.toml') != '' }}
-        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+            patchelf
+      - name: Format
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml -- --check
+      - name: Test
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Clippy (default features)
+        run: cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+      - name: Clippy (simplex-native, check-only)
+        env:
+          SECURE_SIMPLEX_NATIVE_CHECK_ONLY: "1"
+        run: cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets --all-features -- -D warnings
+
+  desktop-windows:
+    name: Tauri desktop tests (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          components: clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: apps/desktop/src-tauri
+      - name: Install NASM (required to build vendored OpenSSL for SQLCipher)
+        uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
+      - name: Test
+        run: cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+
+  # The device-bound anti-rollback backend against a real TPM 2.0 implementation (swtpm), so
+  # Burn's "a restored backup cannot reopen the identity" guarantee is exercised end to end on
+  # the TPM code path, not only against the in-memory test store the desktop tests use.
+  tpm-swtpm:
+    name: TPM 2.0 device-secret backend (swtpm)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Install swtpm and tpm2-tss
+        run: sudo apt-get update && sudo apt-get install -y swtpm libtss2-dev
+      - name: Start swtpm
+        run: |
+          mkdir -p "$RUNNER_TEMP/tpm"
+          swtpm socket --tpm2 --tpmstate dir="$RUNNER_TEMP/tpm" \
+            --server type=tcp,port=2321 --ctrl type=tcp,port=2322 \
+            --flags not-need-init,startup-clear --daemon
+      - name: TPM tests
+        env:
+          SECURE_TPM_TCTI: swtpm:host=127.0.0.1,port=2321
+        run: cargo test --locked -p secure-device --features tpm -- --include-ignored
+
+  supply-chain:
+    name: Supply chain (cargo-deny, SBOM, release metadata)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2,cargo-cyclonedx@0.5.9
+      - name: cargo-deny (core workspace)
+        run: cargo deny --manifest-path Cargo.toml --config deny.toml check
+      - name: cargo-deny (desktop host)
+        run: cargo deny --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml check
+      - name: CycloneDX SBOM (desktop host, the shipped binary)
+        run: |
+          cargo cyclonedx --manifest-path apps/desktop/src-tauri/Cargo.toml --format json --spec-version 1.5
+          mkdir -p release-evidence
+          mv apps/desktop/src-tauri/*.cdx.json release-evidence/
+      - name: Release metadata (Arti, SQLCipher, SimpleX versions)
+        run: python3 scripts/release-metadata.py > release-evidence/release-metadata.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-evidence
+          path: release-evidence/
+          if-no-files-found: error
 
   remediation-gate:
     name: Security remediation gate (docs/security-remediation-plan.md)
     runs-on: ubuntu-latest
-    needs: [rust-core, desktop-check-linux, desktop-check-windows]
+    needs: [rust-core, desktop-linux, desktop-windows, tpm-swtpm, supply-chain]
     steps:
-      - name: Remediation gate placeholder
-        run: |
-          echo "Tracks docs/security-remediation-plan.md phases R0-R9."
-          echo "Phase-specific automated checks land as each phase completes (see plan Verification sections)."
-
-  desktop-check-windows:
-    name: Tauri desktop compile check (Windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          workspaces: apps/desktop/src-tauri
-      - name: Compile desktop host when present
-        if: ${{ hashFiles('apps/desktop/src-tauri/Cargo.toml') != '' }}
-        run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+          persist-credentials: false
+      - name: Every checked remediation item cites only code that exists
+        run: python3 scripts/check-plan-claims.py

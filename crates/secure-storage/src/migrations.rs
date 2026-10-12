@@ -32,6 +32,10 @@ const MIGRATIONS: &[Migration] = &[
         from_version: 2,
         sql: include_str!("migrations/0003_contact_external_id.sql"),
     },
+    Migration {
+        from_version: 3,
+        sql: include_str!("migrations/0004_pending_object_deletions.sql"),
+    },
 ];
 
 pub(crate) fn migrate_to_latest(

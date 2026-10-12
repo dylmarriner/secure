@@ -141,13 +141,25 @@ impl TorTransport {
     pub async fn start(&self) -> Result<(), TransportError> {
         self.apply(TransportEvent::Start)?;
 
-        match TorClient::create_bootstrapped(self.config.clone()).await {
+        let bootstrapped = TorClient::create_bootstrapped(self.config.clone()).await;
+        self.finish_bootstrap(bootstrapped)
+    }
+
+    /// Install a bootstrap's result, unless a concurrent `stop()` already moved the lifecycle
+    /// out of `Bootstrapping` while it was in flight - then the fresh client is discarded rather
+    /// than left installed under a lifecycle that no longer says `Ready`. Split from [`Self::start`]
+    /// so the race can be tested with a real (unbootstrapped, network-free) Arti client.
+    ///
+    /// The client is installed *before* `BootstrapSucceeded` is applied, never after: applying
+    /// first would leave a window in which `stop()` clears the slot and this then installs a
+    /// client under `Stopped`. Installing first is safe because every reader goes through
+    /// [`ready_client`], which refuses unless the lifecycle is `Ready`.
+    fn finish_bootstrap(
+        &self,
+        bootstrapped: arti_client::Result<Arc<TorClient<PreferredRuntime>>>,
+    ) -> Result<(), TransportError> {
+        match bootstrapped {
             Ok(client) => {
-                // A concurrent `stop()` may have already moved the lifecycle out of
-                // `Bootstrapping` (e.g. to `Stopped`) while this bootstrap was in flight. Install
-                // the client only if the transition to `Ready` actually succeeds; otherwise stop
-                // won the race and this freshly-bootstrapped client must be discarded rather than
-                // left installed under a lifecycle that no longer says `Ready`.
                 self.set_client(Some(client));
                 if let Err(error) = self.apply(TransportEvent::BootstrapSucceeded) {
                     self.set_client(None);
@@ -315,21 +327,25 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn stop_wins_against_late_bootstrap_completion() {
-        // Simulates the race without a real Arti bootstrap: `Start` moves the lifecycle to
-        // `Bootstrapping`, `Stop` (racing in from another task) moves it to `Stopped` before the
-        // bootstrap's `BootstrapSucceeded` is applied, so the late completion must be rejected
-        // and no client may end up installed under a `Stopped` lifecycle.
+    #[tokio::test]
+    async fn stop_wins_against_late_bootstrap_completion() {
+        // Start -> Stop races ahead -> the bootstrap completes late with a real Arti client
+        // (built unbootstrapped, so no network I/O). The completion must be rejected and the
+        // client must not stay installed.
         let dir = tempfile::tempdir().expect("tempdir");
         let transport = TorTransport::new(&dir.path().join("state"), &dir.path().join("cache"))
             .expect("build transport config");
 
         transport.apply(TransportEvent::Start).expect("start");
         transport.stop().expect("stop wins the race");
-        assert_eq!(transport.state(), TransportState::Stopped);
 
-        let late_completion = transport.apply(TransportEvent::BootstrapSucceeded);
+        let late_client = TorClient::builder()
+            .config(transport.config.clone())
+            .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+            .create_unbootstrapped()
+            .expect("network-free client");
+        let late_completion = transport.finish_bootstrap(Ok(late_client));
+
         assert!(
             late_completion.is_err(),
             "a bootstrap that finishes after stop must not resurrect Ready"
@@ -339,6 +355,28 @@ mod tests {
             transport.client.lock().unwrap().is_none(),
             "no client may be installed once stop has won"
         );
+    }
+
+    #[tokio::test]
+    async fn no_client_is_installed_after_stopped_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let transport = TorTransport::new(&dir.path().join("state"), &dir.path().join("cache"))
+            .expect("build transport config");
+        transport.stop().expect("stop");
+
+        let client = TorClient::builder()
+            .config(transport.config.clone())
+            .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+            .create_unbootstrapped()
+            .expect("network-free client");
+        assert!(transport.finish_bootstrap(Ok(client)).is_err());
+        assert!(transport.client.lock().unwrap().is_none());
+        assert!(matches!(
+            transport.start_socks_proxy().await,
+            Err(TransportError::NotReady {
+                state: TransportState::Stopped
+            })
+        ));
     }
 
     #[test]

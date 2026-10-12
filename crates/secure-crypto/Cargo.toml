@@ -20,3 +20,6 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

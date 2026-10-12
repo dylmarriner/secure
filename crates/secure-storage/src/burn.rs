@@ -25,9 +25,12 @@
 //!    conversation row itself and the contact are kept, matching the schema's existing
 //!    `destroyed_at_unix_ms` column design: a frozen, content-empty conversation record remains
 //!    as a tombstone rather than disappearing outright;
-//! 6. delete encrypted attachment ciphertext best-effort - not yet applicable: attachment
-//!    ciphertext lives outside this database (Phase 4, not yet implemented) once that pipeline
-//!    exists, its cleanup belongs there, driven off the same tombstone this module writes;
+//! 6. delete encrypted attachment ciphertext best-effort - the ciphertext lives outside this
+//!    database, so step 4 records each object's opaque name in `pending_object_deletions` in the
+//!    same transaction that destroys its key. The owner of the attachment directory deletes the
+//!    files afterwards (`Vault::pending_object_deletions` / `acknowledge_object_deleted`), and
+//!    anything a crash interrupts is still queued on the next unlock - keys before files, and
+//!    files never forgotten;
 //! 7. persist terminal local destruction state - the tombstone's stage reaches `Complete`;
 //! 8. optionally request cooperative remote deletion - out of scope for this crate; it has no
 //!    network access and no protocol adapter dependency by design (see this crate's docs).
@@ -226,6 +229,15 @@ fn run_stage(
             )?;
         }
         BurnStage::AttachmentKeysDestroyed => {
+            // Queue the objects' names before their rows (the only other record of them) go in
+            // the next stage. Same transaction as the key destruction, so there is no crash
+            // window in which keys are gone but the ciphertext has been forgotten.
+            conn.execute(
+                "INSERT OR IGNORE INTO pending_object_deletions (object_name) \
+                 SELECT object_name FROM attachments \
+                 WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?1);",
+                rusqlite::params![conversation_id],
+            )?;
             conn.execute(
                 "UPDATE attachments SET attachment_key = X'' \
                  WHERE message_id IN (SELECT id FROM messages WHERE conversation_id = ?1);",
@@ -488,5 +500,85 @@ mod tests {
 
         let err = burn_conversation(&mut vault, &conversation_id).expect_err("must fail");
         assert!(matches!(err, StorageError::CorruptDestructionStage { .. }));
+    }
+    #[test]
+    fn burn_queues_attachment_objects_for_deletion_and_destroys_their_keys() {
+        let (_dir, mut vault) = open_test_vault();
+        let conversation_id = vault.insert_conversation("c").expect("conversation");
+        let message_id = vault
+            .insert_outgoing_message(&conversation_id, b"ct")
+            .expect("message");
+        let attachment_id = vault
+            .insert_attachment(
+                &message_id,
+                "0123456789abcdef0123456789abcdef",
+                "image/png",
+                3,
+                &[9_u8; 32],
+            )
+            .expect("attachment");
+        assert_eq!(
+            vault
+                .attachment(&attachment_id)
+                .expect("lookup")
+                .key
+                .as_slice(),
+            &[9_u8; 32]
+        );
+
+        burn_conversation(&mut vault, &conversation_id).expect("burn");
+
+        assert!(matches!(
+            vault.attachment(&attachment_id),
+            Err(StorageError::AttachmentNotFound)
+        ));
+        assert_eq!(
+            vault.pending_object_deletions().expect("pending"),
+            ["0123456789abcdef0123456789abcdef"]
+        );
+        vault
+            .acknowledge_object_deleted("0123456789abcdef0123456789abcdef")
+            .expect("ack");
+        assert!(
+            vault
+                .pending_object_deletions()
+                .expect("pending")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn crash_after_key_destruction_keeps_the_object_queued_for_cleanup() {
+        let (_dir, mut vault) = open_test_vault();
+        let conversation_id = vault.insert_conversation("c").expect("conversation");
+        let message_id = vault
+            .insert_outgoing_message(&conversation_id, b"ct")
+            .expect("message");
+        let attachment_id = vault
+            .insert_attachment(
+                &message_id,
+                "fedcba9876543210fedcba9876543210",
+                "x/y",
+                1,
+                &[1_u8; 32],
+            )
+            .expect("attachment");
+
+        // Run exactly the key-destruction stage's transaction, as a crash right after it would
+        // leave things, then check the object is not forgotten.
+        {
+            let conn = vault.connection_mut();
+            let tx = conn.transaction().expect("tx");
+            run_stage(&tx, &conversation_id, BurnStage::AttachmentKeysDestroyed).expect("stage");
+            tx.commit().expect("commit");
+        }
+        assert!(matches!(
+            vault.attachment(&attachment_id),
+            Err(StorageError::AttachmentNotFound)
+        ));
+        assert_eq!(
+            vault.pending_object_deletions().expect("pending"),
+            ["fedcba9876543210fedcba9876543210"]
+        );
     }
 }

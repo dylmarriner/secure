@@ -68,10 +68,13 @@ use tokio::process::{Child, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_config};
 use zeroize::Zeroizing;
 
-use super::protocol::{CommandEnvelope, CorrelationTable, IncomingEnvelope};
+use super::protocol::{
+    CommandEnvelope, CorrelationTable, IncomingEnvelope, PendingGuard, RegisterError,
+};
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -89,6 +92,8 @@ pub enum ClientError {
     },
     #[error("command timed out waiting for a response")]
     Timeout,
+    #[error("too many commands are already awaiting a response")]
+    Busy,
     #[error("the connection to simplex-chat was closed")]
     ConnectionClosed,
     #[error("failed to send a command: {0}")]
@@ -115,102 +120,53 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_RETRY_ATTEMPTS: u32 = 60;
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
-/// A running `simplex-chat -p <port>` subprocess and its WebSocket connection.
-pub struct SimplexClient {
-    child: Child,
-    write: AsyncMutex<futures_util::stream::SplitSink<WsStream, Message>>,
-    correlations: Arc<CorrelationTable>,
-    /// Set once the background read task exits, so `send_command` can fail fast with
-    /// [`ClientError::ConnectionClosed`] instead of hanging on a `corrId` that will never
-    /// receive a response.
-    reader_task: tokio::task::JoinHandle<()>,
-}
+/// Largest WebSocket message/frame accepted from `simplex-chat`
+/// (`docs/security-remediation-plan.md` Phase R7). Chat events are JSON metadata - file
+/// contents never travel over this API - so even a large `newChatItems` batch is far below
+/// this; tungstenite's own defaults (64MiB/16MiB) would let one event force a large allocation.
+/// An oversized message is a protocol error that closes the connection and releases every
+/// waiter, rather than being buffered.
+pub(crate) const MAX_WS_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many parsed-but-unconsumed chat events may queue before the producer waits. Bounded so a
+/// flood of events from the core cannot grow memory without limit; when full, the reader stops
+/// pulling from the socket, which pushes back on the sender instead.
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// Chat events pushed by `simplex-chat` that do not correlate to a command this client sent -
 /// see [`super::protocol::CorrelationTable::route`]. Each item is the raw `resp` JSON object;
-/// this crate does not yet parse specific event shapes (`NewChatItems`, `ContactConnected`,
-/// etc.) into typed values - see the module-level gap note.
-pub type EventReceiver = mpsc::UnboundedReceiver<serde_json::Value>;
+/// parse it with [`crate::parse_chat_event`].
+pub type EventReceiver = mpsc::Receiver<serde_json::Value>;
 
-impl SimplexClient {
-    /// Launch
-    /// `simplex-chat -d <database_path> -k <database_key> -p <port> --socks-proxy <socks_proxy>
-    /// -y --user-display-name <display_name>` and connect to its WebSocket server, retrying the
-    /// connection while the process finishes starting up.
-    ///
-    /// `database_key` and `socks_proxy` are required, not optional: an empty key would leave
-    /// `simplex-chat`'s own database unencrypted, and there is no clearnet-fallback mode for the
-    /// SOCKS proxy - see this module's top-level docs for why each flag is what it is. `-y`
-    /// (`--yes-migrate`) avoids an interactive confirmation prompt on a schema migration after a
-    /// `simplex-chat` upgrade. `--user-display-name` is not optional despite looking like a
-    /// convenience flag: `stdin` is closed below (`Stdio::null()`), and without an existing
-    /// profile the CLI's WebSocket server never starts listening at all - it blocks on an
-    /// interactive "choose your display name" prompt first. This was found by running it, not by
-    /// reading the CLI's own `--help` output, which does not make that ordering obvious - see
-    /// this module's top-level docs.
-    pub async fn launch(
-        binary_path: &PathBuf,
-        port: u16,
-        database_path: &PathBuf,
-        database_key: &Zeroizing<String>,
-        socks_proxy: SocketAddr,
-        display_name: &str,
-    ) -> Result<(Self, EventReceiver), ClientError> {
-        if database_key.is_empty() {
-            return Err(ClientError::EmptyDatabaseKey);
-        }
+fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_WS_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_WS_MESSAGE_BYTES))
+}
 
-        let child = Command::new(binary_path)
-            .arg("-d")
-            .arg(database_path)
-            .arg("-k")
-            .arg(database_key.as_str())
-            .arg("-p")
-            .arg(port.to_string())
-            .arg("--socks-proxy")
-            .arg(socks_proxy.to_string())
-            .arg("-y")
-            .arg("--user-display-name")
-            .arg(display_name)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(ClientError::Spawn)?;
+/// The WebSocket half of a [`SimplexClient`]: request/response correlation, bounded event
+/// forwarding and teardown. Separate from process supervision so it can be exercised against a
+/// local fake server in tests without a real `simplex-chat` binary.
+struct Connection {
+    write: AsyncMutex<futures_util::stream::SplitSink<WsStream, Message>>,
+    correlations: Arc<CorrelationTable>,
+    reader_task: tokio::task::JoinHandle<()>,
+}
 
-        let url = format!("ws://127.0.0.1:{port}");
-        let mut last_error = None;
-        let mut stream = None;
-        for _ in 0..CONNECT_RETRY_ATTEMPTS {
-            match connect_async(&url).await {
-                Ok((ws, _response)) => {
-                    stream = Some(ws);
-                    break;
-                }
-                Err(error) => {
-                    last_error = Some(error);
-                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
-                }
-            }
-        }
-
-        let Some(stream) = stream else {
-            let mut child = child;
-            let _ = child.kill().await;
-            return Err(ClientError::Connect {
-                attempts: CONNECT_RETRY_ATTEMPTS,
-                source: last_error.expect("loop only exits without a stream if an error occurred"),
-            });
-        };
-
+impl Connection {
+    async fn connect(
+        url: &str,
+    ) -> Result<(Self, EventReceiver), tokio_tungstenite::tungstenite::Error> {
+        let (stream, _response) =
+            connect_async_with_config(url, Some(websocket_config()), false).await?;
         let (write, mut read) = stream.split();
         let correlations = Arc::new(CorrelationTable::new());
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
 
         let reader_correlations = Arc::clone(&correlations);
         let reader_task = tokio::spawn(async move {
             while let Some(message) = read.next().await {
+                // Any read error - including an over-limit message - ends the connection.
                 let Ok(message) = message else {
                     break;
                 };
@@ -228,16 +184,18 @@ impl SimplexClient {
                 if let Some(event) = reader_correlations.route(envelope) {
                     // The only failure mode is "no receiver left", meaning the client has
                     // already been dropped; nothing to do but stop forwarding.
-                    if event_tx.send(event).is_err() {
+                    if event_tx.send(event).await.is_err() {
                         break;
                     }
                 }
             }
+            // No response can arrive any more: wake every waiter now rather than leaving each
+            // to run out its full timeout.
+            reader_correlations.close();
         });
 
         Ok((
             Self {
-                child,
                 write: AsyncMutex::new(write),
                 correlations,
                 reader_task,
@@ -246,14 +204,18 @@ impl SimplexClient {
         ))
     }
 
-    /// Send a raw command string and wait for its correlated response, or
-    /// [`ClientError::Timeout`]/[`ClientError::ConnectionClosed`] if none arrives.
-    pub async fn send_command(&self, cmd: String) -> Result<serde_json::Value, ClientError> {
-        if self.reader_task.is_finished() {
-            return Err(ClientError::ConnectionClosed);
-        }
-
-        let (corr_id, rx) = self.correlations.register();
+    async fn send_command(
+        &self,
+        cmd: String,
+        wait: Duration,
+    ) -> Result<serde_json::Value, ClientError> {
+        let (corr_id, rx) = self.correlations.register().map_err(|error| match error {
+            RegisterError::TooManyInFlight => ClientError::Busy,
+            RegisterError::Closed => ClientError::ConnectionClosed,
+        })?;
+        // Removes the entry however this call ends: timeout, send error, or the caller dropping
+        // this future mid-await.
+        let _pending = PendingGuard::new(&self.correlations, corr_id.clone());
         let envelope = CommandEnvelope { corr_id, cmd };
         let json = serde_json::to_string(&envelope).map_err(ClientError::Malformed)?;
 
@@ -264,20 +226,112 @@ impl SimplexClient {
             .await
             .map_err(ClientError::Send)?;
 
-        match timeout(COMMAND_TIMEOUT, rx).await {
+        match timeout(wait, rx).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(_)) => Err(ClientError::ConnectionClosed),
             Err(_) => Err(ClientError::Timeout),
         }
     }
 
-    /// Stop the subprocess. Aborts the background reader task first so it cannot observe (and
-    /// misinterpret) the connection tearing down, then kills the child process - `kill_on_drop`
-    /// on the underlying [`Command`] means this would also happen on drop, but doing it
-    /// explicitly lets a caller await completion rather than leaving it to happen
-    /// asynchronously at an unspecified time.
-    pub async fn shutdown(mut self) {
+    /// Stop reading and release every outstanding waiter with
+    /// [`ClientError::ConnectionClosed`].
+    fn close(&self) {
         self.reader_task.abort();
+        self.correlations.close();
+    }
+}
+
+/// A running `simplex-chat -p <port>` subprocess and its WebSocket connection.
+pub struct SimplexClient {
+    child: Child,
+    connection: Connection,
+}
+
+impl SimplexClient {
+    /// Launch
+    /// `simplex-chat -d <database_path> -k <database_key> -p <port> --socks-proxy <socks_proxy>
+    /// -y --user-display-name <display_name>` and connect to its WebSocket server, retrying the
+    /// connection while the process finishes starting up.
+    ///
+    /// `database_key` and `socks_proxy` are required, not optional: an empty key would leave
+    /// `simplex-chat`'s own database unencrypted, and there is no clearnet-fallback mode for the
+    /// SOCKS proxy - see this module's top-level docs for why each flag is what it is. `-y`
+    /// (`--yes-migrate`) avoids an interactive confirmation prompt on a schema migration after a
+    /// `simplex-chat` upgrade. `--user-display-name` is not optional despite looking like a
+    /// convenience flag: `stdin` is closed below (`Stdio::null()`), and without an existing
+    /// profile the CLI's WebSocket server never starts listening at all - it blocks on an
+    /// interactive "choose your display name" prompt first. This was found by running it, not by
+    /// reading the CLI's own `--help` output, which does not make that ordering obvious - see
+    /// this module's top-level docs.
+    ///
+    /// stdout/stderr go to `Stdio::null()`: a piped stream nobody reads fills its OS buffer and
+    /// then blocks the child on its next write (Phase R7), and the CLI's terminal output can echo
+    /// message content, which must not be captured into this process's logs either.
+    pub async fn launch(
+        binary_path: &PathBuf,
+        port: u16,
+        database_path: &PathBuf,
+        database_key: &Zeroizing<String>,
+        socks_proxy: SocketAddr,
+        display_name: &str,
+    ) -> Result<(Self, EventReceiver), ClientError> {
+        if database_key.is_empty() {
+            return Err(ClientError::EmptyDatabaseKey);
+        }
+
+        let mut child = Command::new(binary_path)
+            .arg("-d")
+            .arg(database_path)
+            .arg("-k")
+            .arg(database_key.as_str())
+            .arg("-p")
+            .arg(port.to_string())
+            .arg("--socks-proxy")
+            .arg(socks_proxy.to_string())
+            .arg("-y")
+            .arg("--user-display-name")
+            .arg(display_name)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(ClientError::Spawn)?;
+
+        let url = format!("ws://127.0.0.1:{port}");
+        let mut last_error = None;
+        for _ in 0..CONNECT_RETRY_ATTEMPTS {
+            match Connection::connect(&url).await {
+                Ok((connection, events)) => {
+                    return Ok((Self { child, connection }, events));
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    tokio::time::sleep(CONNECT_RETRY_DELAY).await;
+                }
+            }
+        }
+
+        let _ = child.kill().await;
+        Err(ClientError::Connect {
+            attempts: CONNECT_RETRY_ATTEMPTS,
+            source: last_error.expect("loop only exits without a stream if an error occurred"),
+        })
+    }
+
+    /// Send a raw command string and wait for its correlated response, or
+    /// [`ClientError::Timeout`]/[`ClientError::ConnectionClosed`]/[`ClientError::Busy`].
+    pub async fn send_command(&self, cmd: String) -> Result<serde_json::Value, ClientError> {
+        self.connection.send_command(cmd, COMMAND_TIMEOUT).await
+    }
+
+    /// Stop the subprocess. Closes the connection first - aborting the reader task so it cannot
+    /// observe (and misinterpret) the teardown, and resolving every outstanding command with
+    /// [`ClientError::ConnectionClosed`] - then kills the child process. `kill_on_drop` on the
+    /// underlying [`Command`] means the kill would also happen on drop, but doing it explicitly
+    /// lets a caller await completion.
+    pub async fn shutdown(mut self) {
+        self.connection.close();
         let _ = self.child.kill().await;
     }
 }
@@ -285,6 +339,7 @@ impl SimplexClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     #[tokio::test]
     async fn launch_refuses_an_empty_database_key_without_spawning_a_process() {
@@ -305,5 +360,115 @@ mod tests {
         .await;
 
         assert!(matches!(result, Err(ClientError::EmptyDatabaseKey)));
+    }
+
+    /// What the fake server does with each command it receives.
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        /// Never answer.
+        Silent,
+        /// Reply to the first command with a message larger than [`MAX_WS_MESSAGE_BYTES`].
+        Oversized,
+    }
+
+    /// A local stand-in for `simplex-chat`'s WebSocket server.
+    async fn fake_server(behaviour: Behaviour) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept");
+            let mut ws = tokio_tungstenite::accept_async(socket)
+                .await
+                .expect("handshake");
+            while let Some(Ok(message)) = ws.next().await {
+                if !message.is_text() {
+                    continue;
+                }
+                if let Behaviour::Oversized = behaviour {
+                    let padding = "x".repeat(MAX_WS_MESSAGE_BYTES + 1);
+                    let event = format!("{{\"resp\":{{\"type\":\"pad\",\"p\":\"{padding}\"}}}}");
+                    let _ = ws.send(Message::Text(event.into())).await;
+                }
+            }
+        });
+        format!("ws://{address}")
+    }
+
+    #[tokio::test]
+    async fn timed_out_requests_leave_the_correlation_table_empty() {
+        let url = fake_server(Behaviour::Silent).await;
+        let (connection, _events) = Connection::connect(&url).await.expect("connect");
+
+        let result = connection
+            .send_command("/_start".to_owned(), Duration::from_millis(50))
+            .await;
+        assert!(matches!(result, Err(ClientError::Timeout)));
+        assert_eq!(connection.correlations.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_command_future_leaves_the_correlation_table_empty() {
+        let url = fake_server(Behaviour::Silent).await;
+        let (connection, _events) = Connection::connect(&url).await.expect("connect");
+
+        let pending = connection.send_command("/_start".to_owned(), Duration::from_secs(30));
+        // Drop the future part-way through, as a caller abandoning the request would.
+        let _ = timeout(Duration::from_millis(50), pending).await;
+        assert_eq!(connection.correlations.pending_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn oversized_websocket_event_closes_the_connection_and_releases_waiters() {
+        let url = fake_server(Behaviour::Oversized).await;
+        let (connection, mut events) = Connection::connect(&url).await.expect("connect");
+
+        let result = connection
+            .send_command("/_start".to_owned(), Duration::from_secs(10))
+            .await;
+        assert!(
+            matches!(result, Err(ClientError::ConnectionClosed)),
+            "expected the over-limit message to close the connection, got {result:?}"
+        );
+        assert!(
+            events.recv().await.is_none(),
+            "oversized event must not be delivered"
+        );
+        assert!(matches!(
+            connection
+                .send_command("/user".to_owned(), Duration::from_secs(1))
+                .await,
+            Err(ClientError::ConnectionClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn teardown_releases_all_waiting_commands() {
+        let url = fake_server(Behaviour::Silent).await;
+        let (connection, _events) = Connection::connect(&url).await.expect("connect");
+        let connection = Arc::new(connection);
+
+        let waiters: Vec<_> = (0..3)
+            .map(|_| {
+                let connection = Arc::clone(&connection);
+                tokio::spawn(async move {
+                    connection
+                        .send_command("/_start".to_owned(), Duration::from_secs(30))
+                        .await
+                })
+            })
+            .collect();
+        while connection.correlations.pending_len() < 3 {
+            tokio::task::yield_now().await;
+        }
+
+        connection.close();
+        for waiter in waiters {
+            let result = timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("waiter must be released promptly, not left to time out")
+                .expect("task");
+            assert!(matches!(result, Err(ClientError::ConnectionClosed)));
+        }
+        assert_eq!(connection.correlations.pending_len(), 0);
     }
 }

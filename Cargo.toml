@@ -4,11 +4,12 @@ members = [
     "crates/secure-attachments",
     "crates/secure-core",
     "crates/secure-crypto",
+    "crates/secure-device",
     "crates/secure-messaging",
     "crates/secure-storage",
     "crates/secure-transport",
 ]
-exclude = ["apps/desktop/src-tauri"]
+exclude = ["apps/desktop/src-tauri", "fuzz"]
 
 [workspace.package]
 edition = "2024"

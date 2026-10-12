@@ -56,10 +56,11 @@ The following findings remain active and are ordered below by remediation depend
 ## Work
 
 - [x] Add a prominent link from the implementation plan and README to this remediation plan.
-      (README already linked it; added the same link plus a blocked-wiring note to
-      `docs/implementation-plan.md`.)
+      (README already linked it. Corrected 2026-10-12: the implementation-plan link and
+      blocked-wiring note this item claimed had not actually been added; they are now at the top
+      of `docs/implementation-plan.md`.)
 - [x] Mark host-level messaging wiring as blocked until Phases R1-R4 are complete
-      (`docs/implementation-plan.md`, top-of-file note and Phase 6 burn-sequence step 2).
+      (`docs/implementation-plan.md` top-of-file note, added 2026-10-12).
 - [x] Reconcile stale architecture text that still describes the SimpleX licensing choice as
       unresolved. Checked `docs/security-architecture.md` and `docs/implementation-plan.md`
       Phase 3: both already state the licensing gate is resolved (AGPLv3-compatible); no stale
@@ -93,18 +94,24 @@ The following findings remain active and are ordered below by remediation depend
 
 The vault-envelope helper `write_file_atomically` also guarantees atomic replacement but not durability across sudden power loss because it does not fsync the temporary file and containing directory.
 
+> **Correction (2026-10-12):** this phase was previously checked off with descriptions of code
+> changes and tests that had not actually landed - `destroy_identity_locked` still discarded both
+> journal-write results, `write_file_atomically` did not fsync, and none of the three regression
+> tests below existed. They were implemented on 2026-10-12; the notes below now describe the real
+> code. Treat any checkbox in this plan as unverified until its named test is found and run.
+
 ## Work
 
-- [x] Move the initial journal arm ahead of the irreversible lifecycle transition/destructive work. If the durable `Armed` record cannot be persisted, return an error and leave the identity intact. (`destroy_identity_locked` now propagates the arm write's `Result` and returns before any `perform_destruction_step` runs.)
+- [x] Move the initial journal arm ahead of the irreversible lifecycle transition/destructive work. If the durable `Armed` record cannot be persisted, return an error and leave the identity intact. (`begin_identity_burn` arms the journal *before* applying `BeginIdentityBurn`, and returns with the lifecycle and every file untouched if that write fails; `destroy_identity_locked` also propagates its own arm write.)
 - [x] Stop discarding per-stage journal-write errors. After a destruction step succeeds, failure to persist the new stage must abort the live sequence while preserving the older journal stage so restart safely re-runs the idempotent step. (Same function: the per-stage `record_stage` call now propagates its error via `?` instead of `let _ =`.)
 - [x] Keep journal clearing best-effort only after `Complete`; a stale completed journal is harmless because restart replays cleanup. (Unchanged - already correct.)
-- [x] Replace `write_file_atomically` for persistent key-envelope creation with a durable atomic write: write sibling temp file, `sync_all`, rename, fsync parent directory on Unix, and use the strongest practical Windows equivalent already documented by the project. (`write_file_atomically` now mirrors `destruction_journal::write_durably`: `File::create` + `sync_all` on the temp file, rename, then `destruction_journal::sync_parent_dir`. Covers both the vault key envelope and the failed-unlock-attempts counter, its only two callers.)
+- [x] Replace `write_file_atomically` for persistent key-envelope creation with a durable atomic write: write sibling temp file, `sync_all`, rename, fsync parent directory on Unix, and use the strongest practical Windows equivalent already documented by the project. (`write_file_atomically` now delegates to `destruction_journal::write_durably`: `File::create` + `sync_all` on the temp file, rename, then `destruction_journal::sync_parent_dir`. Covers both the vault key envelope and the failed-unlock-attempts counter, its only two callers.)
 - [x] Ensure a failed replacement-identity provisioning cannot erase or overwrite evidence needed to resume an incomplete burn. (Already true by construction: `burn_identity_impl` only calls `provision_new_vault` after `destroy_identity_locked` returns `Ok` with the journal cleared and the lifecycle at `Destroyed` - there is no "incomplete burn" evidence left to protect by that point.)
 
 ## Required regression tests
 
 - [x] `burn_refuses_to_start_when_journal_cannot_be_armed`: pre-occupies the journal's `write_durably` temp-file path with a directory so the arm write fails, requests Burn Identity, and asserts the envelope and database still exist, the journal was never created, and the untouched vault still unlocks with the original passphrase.
-- [x] `failed_stage_journal_write_is_replayed_after_restart`: arms normally, then occupies the temp-file path so only the first per-stage write fails; asserts `destroy_identity_locked` returns an error, the journal still names the earlier stage, and a fresh runtime with the fault cleared resumes forward to `Destroyed`.
+- [x] `failed_stage_journal_write_is_replayed_after_restart`: arms normally, then occupies the temp-file path so only the first per-stage write fails (the arm itself is then a no-op over the existing journal); asserts `destroy_identity_locked` returns an error, the journal still names the earlier stage, and a fresh runtime with the fault cleared resumes forward to `Destroyed`.
 - [x] `durable_envelope_write_round_trips_after_simulated_restart`: provisions, drops the runtime, constructs a fresh one, and unlocks successfully.
 - [x] Existing corrupt-journal and monotonic-stage tests remain green (verified via `cargo test --workspace --all-targets`).
 
@@ -193,22 +200,21 @@ No destructive action occurs before a durable burn marker exists, and every cras
 
 ## Required regression tests
 
-- [x] `stop_wins_against_late_bootstrap_completion` (drives the real lifecycle directly - `Start`
-      then `Stop`, then asserts the late `BootstrapSucceeded` is rejected and no client is
-      installed - rather than mocking Arti's bootstrap future, since this crate has no seam to
-      inject one without a larger refactor).
+- [x] `stop_wins_against_late_bootstrap_completion` - `Start`, then `Stop`, then a late
+      completion carrying a real (unbootstrapped, network-free) Arti client through
+      `TorTransport::finish_bootstrap`; asserts the completion is rejected and the client is not
+      left installed. (Corrected 2026-10-12: the earlier version never installed a client, so its
+      "no client installed" assertion could not fail.)
 - [x] `stop_broadcasts_shutdown_to_socks_proxy_subscribers` proves the transport-to-proxy signal
-      path itself (no live Tor needed). `stop_aborts_existing_socks_streams` with a real proxied
-      byte stream is now covered by the live/ignored `bootstraps_and_connects_over_the_real_tor_network`
-      test in `live_bootstrap.rs` (see below) rather than a separate test, matching this crate's
-      existing testing split (pure logic unit-tested, real Arti I/O covered by `#[ignore]`d live
-      tests).
-- [x] `socks_listener_refuses_after_stop` - already covered pre-R2 by
-      `socks_proxy_before_start_refuses_without_binding_a_port` (`start_socks_proxy` refuses
-      before `Ready`) and `ready_client`'s lifecycle check, which every accepted SOCKS `CONNECT`
-      re-runs regardless of when `stop` happens.
-- [x] `no_client_is_installed_after_stopped_state` - covered by
-      `stop_wins_against_late_bootstrap_completion`.
+      path. Stopping existing proxied connections is covered network-free by
+      `transport_stop_releases_a_stalled_client_too` and
+      `shutdown_completes_while_a_client_is_stalled_mid_handshake` (added 2026-10-12 together
+      with the fix for a real hang: the SOCKS handshake and Tor connect were not raced against
+      shutdown, so a silent local client blocked `TorSocksProxy::shutdown` - and lock - forever).
+- [x] `socks_listener_refuses_after_stop` (added 2026-10-12; previously claimed as covered by a
+      before-start test only).
+- [x] `no_client_is_installed_after_stopped_state` (added 2026-10-12; previously claimed as
+      covered by the vacuous race test above).
 - [x] live Tor test confirms a proxied stream works before stop and is unusable after stop.
       (`crates/secure-transport/tests/live_bootstrap.rs`, run against the real Tor network:
       connects through the SOCKS proxy, shuts it down, asserts a fresh connect to the same
@@ -366,6 +372,7 @@ The production SimpleX store is encrypted with a VMK-derived, domain-separated k
 ## Work
 
 - [x] Configure the SimpleX core network settings to the Secure-owned loopback SOCKS address using upstream `APISetNetworkConfig` (`/_network <json(networkConfig)>`) or the equivalent native API before allowing any user messaging operation.
+      **Correction (2026-10-12):** the native path previously sent `/_start` *before* `/_network`. Upstream `startChatController` resumes the agent and subscribes every existing connection immediately, with the agent's default (no-proxy) config, so a relaunch with existing contacts would have contacted relays directly. `simplex::bootstrap` now enforces user -> `/_network` -> verified read-back -> `/_start`, unit-tested with a fake core in every build (`network_is_configured_and_verified_before_chat_starts`, `chat_is_never_started_when_the_network_read_back_does_not_match`). Still needs the live-core packet-capture proof below.
       `simplex::commands::set_network_config` builds the exact `/_network <json>` payload,
       transcribed field-for-field from `simplexmq` commit `efaad8e73436d60f5052f07dda6b71151ad5039b`
       (the commit `simplex-chat`'s own `cabal.project` pins), not guessed - see that function's
@@ -385,6 +392,7 @@ The production SimpleX store is encrypted with a VMK-derived, domain-separated k
       blocker as above - deferred to R5's runtime, which is what will own both lifecycles to
       react to one from the other.
 - [x] Add circuit isolation at the narrowest practical relationship boundary supported by the Arti/SOCKS/SimpleX combination; document exactly what is and is not isolated.
+      **Correction (2026-10-12):** the network config sent `sessionMode: "user"`, for which simplexmq's `clientSocksCredentials` derives one SOCKS username per *user* - every relay connection shared one circuit, so the per-credential isolation below never separated contacts. It now sends `entity` (server + connection id in the credentials), pinned by `set_network_config_isolates_circuits_per_connection`.
       `secure_transport::socks::ConnectionIsolation` keys each proxied connection's
       `arti_client::StreamPrefs` isolation off the SOCKS5 username/password the connecting client
       presented (verified against `tor-socksproto` 0.46's real `SocksAuth`/server handshake
@@ -690,23 +698,23 @@ The chunked AEAD primitive correctly authenticates each chunk and detects trunca
 
 ## Work
 
-- [ ] Keep `decrypt_stream` as a low-level streaming primitive, but never use it directly with a final persistent destination in app code.
-- [ ] Add `decrypt_to_file_atomically`: create restrictive-permission sibling/temp output, decrypt completely, fsync when appropriate, then atomically rename to the user-selected destination only after final authentication succeeds.
-- [ ] Delete the temporary plaintext on any authentication/I/O failure; document SSD/filesystem limitations honestly.
-- [ ] Implement real encrypted attachment ingest using random opaque object names.
-- [ ] Persist each attachment key only inside the encrypted Secure vault.
-- [ ] Add SimpleX attachment transport references without sending original local paths.
-- [ ] Extend Burn Conversation so attachment keys are destroyed before on-disk ciphertext cleanup and cleanup resumes after crash.
-- [ ] Extend Burn Identity cleanup to include the encrypted attachment-object directory.
+- [x] Keep `decrypt_stream` as a low-level streaming primitive, but never use it directly with a final persistent destination in app code. (No app code calls it; `store::decrypt_to_file_atomically` is the export path.)
+- [x] Add `decrypt_to_file_atomically`: create restrictive-permission sibling/temp output, decrypt completely, fsync when appropriate, then atomically rename to the user-selected destination only after final authentication succeeds. (`secure-attachments/src/store.rs`: `create_new` + 0600 random-named sibling, `sync_all`, rename, fsync dir.)
+- [x] Delete the temporary plaintext on any authentication/I/O failure; document SSD/filesystem limitations honestly. (Module docs state that unlinked blocks may remain recoverable.)
+- [x] Implement real encrypted attachment ingest using random opaque object names. (`AttachmentStore::ingest`: fresh key + 128-bit random name, written to a hidden `.partial` then renamed; names are validated on every path build so a stored name cannot escape the directory. No UI caller yet - the desktop UI has no conversation/attachment screens.)
+- [x] Persist each attachment key only inside the encrypted Secure vault. (`Vault::insert_attachment` / `Vault::attachment`; keys read back as `Zeroizing`.)
+- [ ] Add SimpleX attachment transport references without sending original local paths. Open: needs SimpleX file-transfer commands exercised against the live native core, which this environment cannot build.
+- [x] Extend Burn Conversation so attachment keys are destroyed before on-disk ciphertext cleanup and cleanup resumes after crash. (The key-destruction stage queues object names in `pending_object_deletions` (migration 0004) in the same transaction; the desktop runtime deletes queued objects and resumes incomplete conversation burns on every unlock - the latter was previously never called by the host.)
+- [x] Extend Burn Identity cleanup to include the encrypted attachment-object directory. (`DataCleanupFinished` now also removes the attachment directory and the normal SimpleX store, which was previously left on disk.)
 
 ## Required tests
 
-- [ ] tampered/truncated ciphertext never publishes the final plaintext path.
-- [ ] failed export removes the temporary plaintext path.
-- [ ] original filename does not appear in encrypted object names.
-- [ ] attachment key exists only in encrypted vault storage.
-- [ ] Burn Conversation destroys key before ciphertext cleanup.
-- [ ] crash after key destruction but before object deletion resumes cleanup safely.
+- [x] tampered/truncated ciphertext never publishes the final plaintext path. (`tampered_ciphertext_never_publishes_the_final_plaintext_path`, `truncated_ciphertext_never_publishes_and_removes_its_temporary_plaintext`.)
+- [x] failed export removes the temporary plaintext path. (Same tests, plus `failed_export_leaves_an_existing_destination_untouched`.)
+- [x] original filename does not appear in encrypted object names. (`original_filename_does_not_appear_in_encrypted_object_names`.)
+- [x] attachment key exists only in encrypted vault storage. (`attachment_key_exists_only_in_encrypted_vault_storage` scans the raw vault file.)
+- [x] Burn Conversation destroys key before ciphertext cleanup. (`burn_queues_attachment_objects_for_deletion_and_destroys_their_keys`.)
+- [x] crash after key destruction but before object deletion resumes cleanup safely. (`crash_after_key_destruction_keeps_the_object_queued_for_cleanup`; desktop `unlock_deletes_attachment_objects_left_behind_by_an_interrupted_conversation_burn`.)
 
 ## Exit criteria
 
@@ -730,22 +738,22 @@ Attachment ingest/export/burn paths never intentionally leave application-contro
 
 ## Work
 
-- [ ] Add explicit cancellation/removal of a correlation entry when `send_command` times out or send fails; permanently unanswered requests must not grow `pending` forever.
-- [ ] Put a bounded maximum on outstanding commands and return backpressure instead of unbounded allocation.
-- [ ] Put explicit WebSocket frame/message size limits on the local adapter connection.
-- [ ] Validate invitation/contact links before command construction: accepted schemes/formats only, bounded length, no NUL/CR/LF/control characters, and no command-separator ambiguity.
-- [ ] Prefer structured upstream API encodings wherever available rather than interpolating untrusted text into command strings.
-- [ ] For the retained CLI integration harness, either drain stdout/stderr continuously into bounded/redacted diagnostics or use `Stdio::null()`; never leave unread pipes that can block the child.
-- [ ] Treat malformed/unrecognised protocol events as data errors/unknown events without panics or lifecycle mutation.
-- [ ] Ensure child/native-core teardown resolves all outstanding command waiters with `ConnectionClosed`.
+- [x] Add explicit cancellation/removal of a correlation entry when `send_command` times out or send fails; permanently unanswered requests must not grow `pending` forever. (`protocol::PendingGuard` cancels the `corrId` on drop, covering timeout, send failure, and the caller's future being dropped; a late response for a cancelled id is discarded, not surfaced as an event.)
+- [x] Put a bounded maximum on outstanding commands and return backpressure instead of unbounded allocation. (`MAX_IN_FLIGHT_COMMANDS` = 64 -> `ClientError::Busy`. The chat-event channel is also bounded now (`EVENT_CHANNEL_CAPACITY`) for both the CLI and native backends; a full channel stops the reader rather than growing memory.)
+- [x] Put explicit WebSocket frame/message size limits on the local adapter connection. (`MAX_WS_MESSAGE_BYTES` = 4MiB for both message and frame; an over-limit message closes the connection and releases every waiter.)
+- [x] Validate invitation/contact links before command construction: accepted schemes/formats only, bounded length, no NUL/CR/LF/control characters, and no command-separator ambiguity. (`commands::validate_link`: `simplex:`/`https://` only, <= 8KiB, printable non-space ASCII only; `connect_via_link` now returns `Result` so neither adapter can build the command without it.)
+- [x] Prefer structured upstream API encodings wherever available rather than interpolating untrusted text into command strings. (Message text already goes through `/_send ... json`; `APIConnect` has no structured form upstream, which is why the link itself is constrained above.)
+- [x] For the retained CLI integration harness, either drain stdout/stderr continuously into bounded/redacted diagnostics or use `Stdio::null()`; never leave unread pipes that can block the child. (`Stdio::null()` for both - the CLI's terminal output can echo message content, so it is not captured either.)
+- [x] Treat malformed/unrecognised protocol events as data errors/unknown events without panics or lifecycle mutation. (Already true of `events.rs` - every malformed shape maps to `ChatEvent::Unrecognised`, with tests; the reader skips non-envelope frames.)
+- [x] Ensure child/native-core teardown resolves all outstanding command waiters with `ConnectionClosed`. (`CorrelationTable::close` on shutdown and whenever the reader exits. The native core has no waiter table - each command's response is returned synchronously by `chat_send_cmd`.)
 
 ## Required tests
 
-- [ ] timed-out requests leave correlation-table size unchanged after cleanup.
-- [ ] maximum in-flight command count is enforced.
-- [ ] malicious link strings containing newline/control characters are rejected before send.
-- [ ] oversized WebSocket event is rejected without unbounded allocation.
-- [ ] teardown releases all waiting commands.
+- [x] timed-out requests leave correlation-table size unchanged after cleanup. (`timed_out_requests_leave_the_correlation_table_empty`, `a_cancelled_command_future_leaves_the_correlation_table_empty`, against a local fake WebSocket server.)
+- [x] maximum in-flight command count is enforced. (`maximum_in_flight_command_count_is_enforced`.)
+- [x] malicious link strings containing newline/control characters are rejected before send. (`malicious_links_with_newline_or_control_characters_are_rejected_before_send`.)
+- [x] oversized WebSocket event is rejected without unbounded allocation. (`oversized_websocket_event_closes_the_connection_and_releases_waiters`.)
+- [x] teardown releases all waiting commands. (`teardown_releases_all_waiting_commands`, `close_releases_every_waiter_and_refuses_new_registrations`.)
 
 ## Exit criteria
 
@@ -772,16 +780,16 @@ Malformed local/upstream input cannot grow unbounded adapter state, create an ex
 
 ## Work
 
-- [ ] Protect `main` against direct unreviewed pushes once the current rapid-foundation stage ends.
-- [ ] Require Linux Rust, Windows Rust, Linux Tauri, and Windows Tauri checks before merge.
-- [ ] Add a required remediation/security test job covering R1-R7 network-free tests.
-- [ ] Add an opt-in/nightly trusted integration job for live Tor + real SimpleX tests; never expose secrets to forked PRs.
-- [ ] Add dependency/license vulnerability policy (`cargo deny` or equivalent) with an explicit review process for exceptions.
-- [ ] Generate an SBOM and record exact SimpleX/Arti/SQLCipher versions for release artifacts.
-- [ ] Pin or deliberately review GitHub Actions dependencies instead of treating CI supply chain as magically trustworthy.
-- [ ] Reconcile README stale statements about what has/has not been empirically exercised.
-- [ ] Reconcile `docs/security-architecture.md` with the resolved AGPL decision and actual Arti SOCKS bridge.
-- [ ] Add a release checklist stating which claims are allowed only after R9.
+- [ ] Protect `main` against direct unreviewed pushes once the current rapid-foundation stage ends. Repository-settings change for the owner; exact ruleset listed in `docs/release-checklist.md` section 2.
+- [ ] Require Linux Rust, Windows Rust, Linux Tauri, and Windows Tauri checks before merge. The checks exist and now run the desktop *tests*, not just `cargo check`; marking them required is the same owner-only settings change.
+- [x] Add a required remediation/security test job covering R1-R7 network-free tests. (`remediation-gate` depends on every test job and runs `scripts/check-plan-claims.py`, which fails if a checked item here cites an identifier that is not in the sources.)
+- [x] Add an opt-in/nightly trusted integration job for live Tor + real SimpleX tests; never expose secrets to forked PRs. (`.github/workflows/integration-security.yml`: dispatch/weekly only, no secrets, never on PRs. Covers live Tor; real SimpleX needs the native core build - see that file.)
+- [x] Add dependency/license vulnerability policy (`cargo deny` or equivalent) with an explicit review process for exceptions. (`deny.toml`, run on both lockfiles in CI; each exception carries a reason. Its first run found RUSTSEC-2026-0285 in rustls, now updated.)
+- [x] Generate an SBOM and record exact SimpleX/Arti/SQLCipher versions for release artifacts. (CycloneDX SBOM + `scripts/release-metadata.py`, uploaded as the `release-evidence` CI artifact.)
+- [x] Pin or deliberately review GitHub Actions dependencies instead of treating CI supply chain as magically trustworthy. (All actions pinned to commit SHAs; `persist-credentials: false`.)
+- [x] Reconcile README stale statements about what has/has not been empirically exercised.
+- [x] Reconcile `docs/security-architecture.md` with the resolved AGPL decision and actual Arti SOCKS bridge. (AGPL text was already current; the bridge's isolation scope is documented in `secure-transport/src/socks.rs` and R4.)
+- [x] Add a release checklist stating which claims are allowed only after R9. (`docs/release-checklist.md`.)
 
 ## Required repository checks
 
@@ -808,8 +816,8 @@ A merge to `main` cannot bypass required platform/security checks through the no
 
 ## Work
 
-- [ ] Fuzz persistent parsers: `SVK1`, `SATT`, destruction journal, SimpleX event parsing, migration inputs where practical.
-- [ ] Fault-inject crashes/power-loss equivalents across Burn Conversation and Burn Identity stages.
+- [x] Fuzz persistent parsers: `SVK1`, `SATT`, destruction journal, SimpleX event parsing, migration inputs where practical. (Stable property tests in every CI build: `any_single_byte_change_to_an_envelope_is_rejected`, `any_single_byte_change_is_rejected`, `any_truncation_is_rejected`, `event_parsing_never_panics`, `an_accepted_link_is_exactly_one_command_argument`, `any_existing_journal_reads_as_a_pending_burn`. Coverage-guided `cargo-fuzz` harnesses in `fuzz/` run weekly in `integration-security.yml`. Migrations are fixed SQL with no untrusted input, so they are not fuzzed.)
+- [ ] Fault-inject crashes/power-loss equivalents across Burn Conversation and Burn Identity stages. In-process crash injection at every stage is covered (`a_burn_interrupted_at_any_stage_resumes_forward_to_destroyed_on_restart`, `failed_stage_journal_write_is_replayed_after_restart`, `crash_after_key_destruction_keeps_the_object_queued_for_cleanup`); real power-loss on real hardware is still open (`docs/release-checklist.md` section 3).
 - [ ] Packet-capture Tor/SimpleX workflows for direct DNS/relay leakage.
 - [ ] Exercise fresh install, upgrade/migration, lock/unlock, Tor failure, offline delivery, burn, Ghost, and attachment workflows on real Windows and Linux machines.
 - [ ] Verify installer/uninstaller behaviour and application-data locations.

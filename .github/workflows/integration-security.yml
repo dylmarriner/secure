@@ -1,0 +1,62 @@
+name: Integration security (live Tor)
+
+# Live-network tests that cannot run on every PR: they bootstrap against the real Tor network.
+# Trusted triggers only - manual dispatch and a weekly schedule on the default branch. This
+# workflow never runs for pull requests (so forked code never executes here) and uses no
+# repository secrets. docs/security-remediation-plan.md R8.
+#
+# Not covered here yet: the SimpleX two-client round trip and kill-the-SOCKS-bridge tests need
+# the simplex-native core built from source (scripts/build-simplex-native.sh, GHC 9.6 + cabal,
+# ~1h) and packet capture needs a dedicated host; see R4/R9.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  live-tor:
+    name: Live Tor bootstrap and SOCKS shutdown
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Live Tor tests
+        run: cargo test --locked -p secure-transport --test live_bootstrap -- --ignored --nocapture
+
+  fuzz:
+    name: Fuzz persistent/untrusted parsers (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [svk1_envelope, satt_decrypt, simplex_events]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: nightly
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-fuzz@0.13.2
+      - name: Fuzz for 15 minutes
+        working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=900
+      - name: Keep any crashing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

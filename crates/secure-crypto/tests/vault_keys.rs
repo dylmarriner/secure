@@ -107,3 +107,77 @@ fn repeated_generate_and_drop_does_not_panic() {
         drop(key);
     }
 }
+
+mod device_bound {
+    use secure_crypto::{Argon2Profile, CryptoError, VaultKey, VaultKeyEnvelope};
+
+    const FAST: Argon2Profile = Argon2Profile {
+        memory_kib: 8 * 1024,
+        iterations: 1,
+        parallelism: 1,
+    };
+    const PASS: &[u8] = b"correct horse battery staple";
+
+    #[test]
+    fn device_bound_envelope_round_trips_with_the_same_device_secret() {
+        let key = VaultKey::generate().expect("key");
+        let secret = [7_u8; 32];
+        let envelope =
+            VaultKeyEnvelope::seal_device_bound(PASS, &secret, &key, FAST).expect("seal");
+        assert!(envelope.is_device_bound());
+        let reparsed = VaultKeyEnvelope::from_bytes(&envelope.to_bytes()).expect("parse");
+        let opened = reparsed.open_device_bound(PASS, &secret).expect("open");
+        assert_eq!(opened.as_bytes(), key.as_bytes());
+    }
+
+    #[test]
+    fn a_destroyed_or_different_device_secret_makes_the_correct_passphrase_useless() {
+        let key = VaultKey::generate().expect("key");
+        let envelope =
+            VaultKeyEnvelope::seal_device_bound(PASS, &[1_u8; 32], &key, FAST).expect("seal");
+        assert_eq!(
+            envelope.open_device_bound(PASS, &[2_u8; 32]).err(),
+            Some(CryptoError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn a_device_bound_envelope_cannot_be_opened_without_the_device_secret() {
+        let key = VaultKey::generate().expect("key");
+        let envelope =
+            VaultKeyEnvelope::seal_device_bound(PASS, &[1_u8; 32], &key, FAST).expect("seal");
+        assert_eq!(
+            envelope.open(PASS).err(),
+            Some(CryptoError::DeviceSecretRequired)
+        );
+    }
+
+    #[test]
+    fn relabelling_a_device_bound_envelope_as_legacy_fails_authentication() {
+        let key = VaultKey::generate().expect("key");
+        let envelope =
+            VaultKeyEnvelope::seal_device_bound(PASS, &[1_u8; 32], &key, FAST).expect("seal");
+        let mut bytes = envelope.to_bytes();
+        bytes[4] = 1; // the version byte
+        let relabelled = VaultKeyEnvelope::from_bytes(&bytes).expect("structurally valid");
+        assert_eq!(
+            relabelled.open(PASS).err(),
+            Some(CryptoError::AuthenticationFailed)
+        );
+    }
+
+    #[test]
+    fn a_legacy_envelope_is_not_accepted_where_a_device_bound_one_is_required() {
+        let key = VaultKey::generate().expect("key");
+        let legacy = VaultKeyEnvelope::seal(PASS, &key, FAST).expect("seal");
+        assert!(!legacy.is_device_bound());
+        assert_eq!(
+            legacy.open_device_bound(PASS, &[1_u8; 32]).err(),
+            Some(CryptoError::NotDeviceBound)
+        );
+        assert_eq!(
+            legacy.open(PASS).expect("legacy open").as_bytes(),
+            key.as_bytes()
+        );
+    }
+}

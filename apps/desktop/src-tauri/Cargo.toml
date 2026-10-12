@@ -6,6 +6,10 @@ rust-version = "1.85"
 license = "AGPL-3.0-or-later"
 publish = false
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The TPM 2.0 backend for device-bound anti-rollback state (needs the tpm2-tss system libraries).
+secure-device = { path = "../../../crates/secure-device", features = ["tpm"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -13,6 +17,8 @@ tauri-build = { version = "2", features = [] }
 secure-core = { path = "../../../crates/secure-core" }
 secure-crypto = { path = "../../../crates/secure-crypto" }
 secure-messaging = { path = "../../../crates/secure-messaging" }
+secure-attachments = { path = "../../../crates/secure-attachments" }
+secure-device = { path = "../../../crates/secure-device" }
 secure-storage = { path = "../../../crates/secure-storage" }
 secure-transport = { path = "../../../crates/secure-transport" }
 rand_core = { version = "0.6.4", features = ["getrandom"] }
@@ -22,6 +28,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = tr
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 
 [dev-dependencies]
+secure-device = { path = "../../../crates/secure-device", features = ["test-store"] }
+proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
