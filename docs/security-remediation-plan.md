@@ -730,22 +730,22 @@ Attachment ingest/export/burn paths never intentionally leave application-contro
 
 ## Work
 
-- [ ] Add explicit cancellation/removal of a correlation entry when `send_command` times out or send fails; permanently unanswered requests must not grow `pending` forever.
-- [ ] Put a bounded maximum on outstanding commands and return backpressure instead of unbounded allocation.
-- [ ] Put explicit WebSocket frame/message size limits on the local adapter connection.
-- [ ] Validate invitation/contact links before command construction: accepted schemes/formats only, bounded length, no NUL/CR/LF/control characters, and no command-separator ambiguity.
-- [ ] Prefer structured upstream API encodings wherever available rather than interpolating untrusted text into command strings.
-- [ ] For the retained CLI integration harness, either drain stdout/stderr continuously into bounded/redacted diagnostics or use `Stdio::null()`; never leave unread pipes that can block the child.
-- [ ] Treat malformed/unrecognised protocol events as data errors/unknown events without panics or lifecycle mutation.
-- [ ] Ensure child/native-core teardown resolves all outstanding command waiters with `ConnectionClosed`.
+- [x] Add explicit cancellation/removal of a correlation entry when `send_command` times out or send fails; permanently unanswered requests must not grow `pending` forever. (`protocol::PendingGuard` cancels the `corrId` on drop, covering timeout, send failure, and the caller's future being dropped; a late response for a cancelled id is discarded, not surfaced as an event.)
+- [x] Put a bounded maximum on outstanding commands and return backpressure instead of unbounded allocation. (`MAX_IN_FLIGHT_COMMANDS` = 64 -> `ClientError::Busy`. The chat-event channel is also bounded now (`EVENT_CHANNEL_CAPACITY`) for both the CLI and native backends; a full channel stops the reader rather than growing memory.)
+- [x] Put explicit WebSocket frame/message size limits on the local adapter connection. (`MAX_WS_MESSAGE_BYTES` = 4MiB for both message and frame; an over-limit message closes the connection and releases every waiter.)
+- [x] Validate invitation/contact links before command construction: accepted schemes/formats only, bounded length, no NUL/CR/LF/control characters, and no command-separator ambiguity. (`commands::validate_link`: `simplex:`/`https://` only, <= 8KiB, printable non-space ASCII only; `connect_via_link` now returns `Result` so neither adapter can build the command without it.)
+- [x] Prefer structured upstream API encodings wherever available rather than interpolating untrusted text into command strings. (Message text already goes through `/_send ... json`; `APIConnect` has no structured form upstream, which is why the link itself is constrained above.)
+- [x] For the retained CLI integration harness, either drain stdout/stderr continuously into bounded/redacted diagnostics or use `Stdio::null()`; never leave unread pipes that can block the child. (`Stdio::null()` for both - the CLI's terminal output can echo message content, so it is not captured either.)
+- [x] Treat malformed/unrecognised protocol events as data errors/unknown events without panics or lifecycle mutation. (Already true of `events.rs` - every malformed shape maps to `ChatEvent::Unrecognised`, with tests; the reader skips non-envelope frames.)
+- [x] Ensure child/native-core teardown resolves all outstanding command waiters with `ConnectionClosed`. (`CorrelationTable::close` on shutdown and whenever the reader exits. The native core has no waiter table - each command's response is returned synchronously by `chat_send_cmd`.)
 
 ## Required tests
 
-- [ ] timed-out requests leave correlation-table size unchanged after cleanup.
-- [ ] maximum in-flight command count is enforced.
-- [ ] malicious link strings containing newline/control characters are rejected before send.
-- [ ] oversized WebSocket event is rejected without unbounded allocation.
-- [ ] teardown releases all waiting commands.
+- [x] timed-out requests leave correlation-table size unchanged after cleanup. (`timed_out_requests_leave_the_correlation_table_empty`, `a_cancelled_command_future_leaves_the_correlation_table_empty`, against a local fake WebSocket server.)
+- [x] maximum in-flight command count is enforced. (`maximum_in_flight_command_count_is_enforced`.)
+- [x] malicious link strings containing newline/control characters are rejected before send. (`malicious_links_with_newline_or_control_characters_are_rejected_before_send`.)
+- [x] oversized WebSocket event is rejected without unbounded allocation. (`oversized_websocket_event_closes_the_connection_and_releases_waiters`.)
+- [x] teardown releases all waiting commands. (`teardown_releases_all_waiting_commands`, `close_releases_every_waiter_and_refuses_new_registrations`.)
 
 ## Exit criteria
 

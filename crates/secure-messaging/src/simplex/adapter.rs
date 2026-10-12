@@ -33,6 +33,8 @@ pub enum AdapterError {
     UnexpectedResponse(serde_json::Value),
     #[error("bootstrap must complete before this operation")]
     NotBootstrapped,
+    #[error("refusing contact link: {0}")]
+    InvalidLink(#[from] commands::InvalidLink),
     #[error(
         "simplex-chat's effective SOCKS proxy ({actual:?}) does not match the Secure-owned \
          loopback bridge ({expected}) - refusing to allow messaging over an unverified path"
@@ -149,7 +151,7 @@ impl SimplexAdapter {
     /// another party.
     pub async fn accept_invitation(&self, link: &str) -> Result<(), AdapterError> {
         let user_id = self.require_user_id().await?;
-        self.run(commands::connect_via_link(user_id, link)).await?;
+        self.run(commands::connect_via_link(user_id, link)?).await?;
         Ok(())
     }
 

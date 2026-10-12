@@ -41,7 +41,7 @@ use super::adapter::{
     AdapterError, Invitation, extract_invitation_link, extract_socks_proxy, extract_user_id,
     is_error_response,
 };
-use super::client::EventReceiver;
+use super::client::{EVENT_CHANNEL_CAPACITY, EventReceiver};
 use super::commands::{self, ChatKind};
 use super::core::SimplexCore;
 
@@ -83,7 +83,7 @@ impl NativeSimplexAdapter {
             .expect("spawn_blocking task panicked")?;
         let core = Arc::new(std::sync::Mutex::new(core));
 
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let stop_events = Arc::new(AtomicBool::new(false));
 
         let poll_core = Arc::clone(&core);
@@ -107,7 +107,7 @@ impl NativeSimplexAdapter {
                         // The only failure mode is "no receiver left", meaning the adapter has
                         // already been dropped without going through `shutdown` - nothing to do
                         // but stop polling, matching `client.rs`'s reader task.
-                        if event_tx.send(value).is_err() {
+                        if event_tx.send(value).await.is_err() {
                             break;
                         }
                     }
@@ -183,7 +183,7 @@ impl NativeSimplexAdapter {
     /// Accept an invitation (or connect to a contact address / group link).
     pub async fn accept_invitation(&self, link: &str) -> Result<(), AdapterError> {
         let user_id = self.require_user_id().await?;
-        self.run(commands::connect_via_link(user_id, link)).await?;
+        self.run(commands::connect_via_link(user_id, link)?).await?;
         Ok(())
     }
 
