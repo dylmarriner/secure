@@ -32,6 +32,10 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets
       - name: Clippy
+        # `--all-features` includes `simplex-native`, whose 233MB native core is not available
+        # on hosted runners; check-only mode lints its FFI code without linking it.
+        env:
+          SECURE_SIMPLEX_NATIVE_CHECK_ONLY: "1"
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   desktop-check-linux:

@@ -7,6 +7,21 @@ fn main() {
         return;
     }
 
+    println!("cargo::rerun-if-env-changed=SECURE_SIMPLEX_NATIVE_CHECK_ONLY");
+    // Lint/type-check-only mode for CI (`cargo clippy --all-features`): `cargo check` and clippy
+    // never link, so the native core's FFI declarations can be checked without the 233MB
+    // artifact. Anything that does link (`cargo build`/`cargo test`) with this set fails at link
+    // time on the unresolved `hs_init`/`chat_*` symbols rather than silently producing a binary,
+    // so this cannot be used to ship a build without the real core. It must be opted into
+    // explicitly; the default remains the loud panic below.
+    if std::env::var_os("SECURE_SIMPLEX_NATIVE_CHECK_ONLY").is_some_and(|value| value == "1") {
+        println!(
+            "cargo::warning=SECURE_SIMPLEX_NATIVE_CHECK_ONLY=1: simplex-native is type-checked \
+             only and will not link"
+        );
+        return;
+    }
+
     let lib_dir = std::env::var("SECURE_SIMPLEX_NATIVE_LIB_DIR").unwrap_or_else(|_| {
         panic!(
             "the `simplex-native` feature requires SECURE_SIMPLEX_NATIVE_LIB_DIR to point at a \
