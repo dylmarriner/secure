@@ -191,7 +191,17 @@ pub(crate) struct AppRuntime {
     /// the `start_tor` command, not something onboarding/unlock does implicitly. There is no
     /// messaging layer yet to decide *when* Tor should be required, so this deliberately does
     /// not interlock with vault lock/unlock - see `docs/implementation-plan.md` Phase 2.
-    transport: TorTransport,
+    ///
+    /// Behind a mutex because `Stopped` is terminal for a `TorTransport` (R2 relies on that: a
+    /// late bootstrap can never revive a stopped client), while lock/unlock and Burn Identity
+    /// with a replacement must be able to bring Tor back. [`Self::startable_transport`] swaps a
+    /// stopped instance for a fresh one; nothing ever restarts a stopped instance. Never held
+    /// across an `.await` - callers clone the `Arc` out via [`Self::transport`].
+    transport: Mutex<Arc<TorTransport>>,
+    #[cfg_attr(not(feature = "simplex-native"), allow(dead_code))]
+    tor_state_dir: PathBuf,
+    #[cfg_attr(not(feature = "simplex-native"), allow(dead_code))]
+    tor_cache_dir: PathBuf,
     /// The active Ghost session's ephemeral identity, if any - see [`GhostSession`]. Never
     /// read or written by any code path that also touches `paths`/`unlocked`; that separation
     /// is what makes "normal database remains unchanged by Ghost conversations" true by
@@ -230,7 +240,9 @@ impl AppRuntime {
                 lifecycle: Mutex::new(AppLifecycle::resuming_destruction(stage)),
                 paths,
                 unlocked: Arc::new(Mutex::new(None)),
-                transport,
+                transport: Mutex::new(Arc::new(transport)),
+                tor_state_dir,
+                tor_cache_dir,
                 ghost: Mutex::new(None),
                 #[cfg(feature = "simplex-native")]
                 messaging: tokio::sync::Mutex::new(None),
@@ -266,11 +278,39 @@ impl AppRuntime {
             lifecycle: Mutex::new(lifecycle),
             paths,
             unlocked: Arc::new(Mutex::new(None)),
-            transport,
+            transport: Mutex::new(Arc::new(transport)),
+            tor_state_dir,
+            tor_cache_dir,
             ghost: Mutex::new(None),
             #[cfg(feature = "simplex-native")]
             messaging: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// The current Tor transport.
+    fn transport(&self) -> Arc<TorTransport> {
+        Arc::clone(
+            &self
+                .transport
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// The current transport, replaced first by a fresh, never-started one if it has been
+    /// stopped (e.g. by a previous lock). Constructing a transport performs no network I/O.
+    #[cfg_attr(not(feature = "simplex-native"), allow(dead_code))]
+    fn startable_transport(&self) -> Result<Arc<TorTransport>, String> {
+        let mut slot = self
+            .transport
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.state() == TransportState::Stopped {
+            let fresh = TorTransport::new(&self.tor_state_dir, &self.tor_cache_dir)
+                .map_err(|error| format!("failed to configure Tor transport: {error}"))?;
+            *slot = Arc::new(fresh);
+        }
+        Ok(Arc::clone(&slot))
     }
 
     /// Drive a Burn Identity that a previous run started but did not finish through to
@@ -456,8 +496,9 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
         // returns). Best-effort: a transport that is already stopped, or that fails to stop
         // cleanly, must not block identity destruction.
         DestructionEvent::NetworkStopped => {
-            if runtime.transport.state() != TransportState::Stopped {
-                let _ = runtime.transport.stop();
+            let transport = runtime.transport();
+            if transport.state() != TransportState::Stopped {
+                let _ = transport.stop();
             }
         }
 
@@ -991,7 +1032,7 @@ pub(crate) fn burn_identity_impl(
 }
 
 pub(crate) fn tor_status_impl(runtime: &AppRuntime) -> TorStatus {
-    tor_status_for(&runtime.transport)
+    tor_status_for(&runtime.transport())
 }
 
 /// Routes delivered `ChatEvent`s into the same unlocked vault `lock`/`messaging_key` use - see
@@ -1130,15 +1171,15 @@ fn messaging_context(runtime: &AppRuntime) -> Result<MessagingContext, String> {
 pub(crate) async fn start_messaging_impl(runtime: &AppRuntime) -> Result<MessagingStatus, String> {
     let context = messaging_context(runtime)?;
 
-    if runtime.transport.state() != TransportState::Ready {
+    let transport = runtime.transport();
+    if transport.state() != TransportState::Ready {
         return Err("Tor must be ready before messaging can start".to_owned());
     }
     if runtime.messaging.lock().await.is_some() {
         return Ok(MessagingStatus { state: "ready" });
     }
 
-    let proxy = runtime
-        .transport
+    let proxy = transport
         .start_socks_proxy()
         .await
         .map_err(|error| error.to_string())?;
@@ -1194,8 +1235,17 @@ pub(crate) async fn unlock_application_with_messaging(
 ) -> Result<AppStatus, String> {
     unlock_application_impl(passphrase, runtime)?;
 
+    // A previous lock stopped the old transport for good; bring up a fresh one rather than
+    // failing every unlock after the first until the application is restarted.
+    let transport = match runtime.startable_transport() {
+        Ok(transport) => transport,
+        Err(error) => {
+            let _ = lock_application_impl(runtime);
+            return Err(error);
+        }
+    };
     if matches!(
-        runtime.transport.state(),
+        transport.state(),
         TransportState::NotStarted | TransportState::Failed
     ) && let Err(error) = start_tor_impl(runtime).await
     {
@@ -1306,11 +1356,11 @@ pub(crate) async fn send_text_message_impl(
 /// `Failed`); calling it again from `Failed` retries, which is the intended retry policy.
 pub(crate) async fn start_tor_impl(runtime: &AppRuntime) -> Result<TorStatus, String> {
     runtime
-        .transport
+        .transport()
         .start()
         .await
         .map_err(|error| error.to_string())?;
-    Ok(tor_status_for(&runtime.transport))
+    Ok(tor_status_for(&runtime.transport()))
 }
 
 /// Stop the managed Tor transport. Idempotent: stopping an already-`Stopped` transport is a
@@ -1318,13 +1368,11 @@ pub(crate) async fn start_tor_impl(runtime: &AppRuntime) -> Result<TorStatus, St
 /// matching `lock_application`'s idempotency for the same reason - a caller asking to stop
 /// something that is already stopped is not an error condition.
 pub(crate) fn stop_tor_impl(runtime: &AppRuntime) -> Result<TorStatus, String> {
-    if runtime.transport.state() != TransportState::Stopped {
-        runtime
-            .transport
-            .stop()
-            .map_err(|error| error.to_string())?;
+    let transport = runtime.transport();
+    if transport.state() != TransportState::Stopped {
+        transport.stop().map_err(|error| error.to_string())?;
     }
-    Ok(tor_status_for(&runtime.transport))
+    Ok(tor_status_for(&runtime.transport()))
 }
 
 #[cfg(test)]
@@ -1920,6 +1968,31 @@ mod tests {
                 .pending_object_deletions()
                 .expect("pending")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_stopped_transport_is_replaced_by_a_fresh_one_for_the_next_unlock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+
+        let original = runtime.startable_transport().expect("transport");
+        assert!(
+            Arc::ptr_eq(&original, &runtime.transport()),
+            "a transport that was never stopped must be kept, not replaced"
+        );
+
+        // What lock does: the old instance becomes permanently `Stopped`.
+        stop_tor_impl(&runtime).expect("stop");
+        assert_eq!(original.state(), TransportState::Stopped);
+
+        let fresh = runtime.startable_transport().expect("fresh transport");
+        assert!(!Arc::ptr_eq(&original, &fresh));
+        assert_eq!(fresh.state(), TransportState::NotStarted);
+        assert_eq!(
+            original.state(),
+            TransportState::Stopped,
+            "the stopped instance itself is never revived"
         );
     }
 
