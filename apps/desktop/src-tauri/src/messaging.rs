@@ -66,23 +66,18 @@ impl MessagingRuntime {
     /// Bring up the messaging stack behind an already-`Ready` Tor transport's SOCKS proxy:
     /// open the native SimpleX store at `db_file_prefix` under `db_key` (a
     /// `SubkeyPurpose::MessagingDatabaseV1` subkey, never the raw passphrase - see
-    /// `NativeSimplexAdapter::open`), bootstrap (creates the local user - the native store has
-    /// no equivalent of the CLI adapter's launch-time `--user` creation, so unlike
-    /// `SimplexAdapter::configure_network`, `NativeSimplexAdapter::configure_network` errors
-    /// with `noActiveUser` if called before a user exists - confirmed against the real native
-    /// core, not assumed), then point it at `proxy`'s loopback address and verify the read-back
-    /// matches (`docs/security-remediation-plan.md` Phase R4).
+    /// `NativeSimplexAdapter::open`), then `NativeSimplexAdapter::bootstrap`, which ensures the
+    /// local user exists, points the core at `proxy`'s loopback address, verifies the read-back,
+    /// and only then starts the chat controller (`docs/security-remediation-plan.md` Phase R4).
     ///
-    /// `bootstrap` itself makes no network calls (`start_chat`/`create_native_user`/
-    /// `show_active_user` are all local chat-controller/store operations), so running it before
-    /// `configure_network` does not weaken the fail-closed guarantee: no method that can
-    /// actually originate network traffic (`create_invitation`/`accept_invitation`/
-    /// `send_text_message`) is reachable until `start` returns `Ok`, and `configure_network`
-    /// still runs - and is still verified - before that happens.
+    /// The order matters: upstream `/_start` immediately subscribes every existing connection to
+    /// its relays with whatever network config the agent holds, and the default has no proxy. An
+    /// earlier version of this function started the chat before configuring the network, which
+    /// would have connected to relays directly on every launch with existing contacts.
     ///
-    /// Fails closed at every step: a `bootstrap`/`configure_network` failure shuts the
-    /// half-open adapter down before returning, so a caller never observes a partially-started
-    /// `MessagingRuntime` and never needs to guess whether cleanup already happened.
+    /// Fails closed at every step: a failure shuts the half-open adapter down before returning,
+    /// so a caller never observes a partially-started `MessagingRuntime` and never needs to
+    /// guess whether cleanup already happened.
     pub(crate) async fn start(
         proxy: TorSocksProxy,
         db_file_prefix: PathBuf,
@@ -104,12 +99,10 @@ impl MessagingRuntime {
             Err(error) => return Err(MessagingStartError { proxy, error }),
         };
 
-        if let Err(error) = adapter.bootstrap().await {
-            adapter.shutdown().await;
-            return Err(MessagingStartError { proxy, error });
-        }
-
-        if let Err(error) = adapter.configure_network(socks_address).await {
+        // One call, fixed order: user -> verified `/_network` -> `/_start`. Starting the chat
+        // before the network config is verified would subscribe existing contacts' relays
+        // directly, outside Tor (see `secure_messaging`'s `simplex::bootstrap` module docs).
+        if let Err(error) = adapter.bootstrap(socks_address).await {
             adapter.shutdown().await;
             return Err(MessagingStartError { proxy, error });
         }

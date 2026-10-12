@@ -37,10 +37,8 @@ use std::time::Duration;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use zeroize::Zeroizing;
 
-use super::adapter::{
-    AdapterError, Invitation, extract_invitation_link, extract_socks_proxy, extract_user_id,
-    is_error_response,
-};
+use super::adapter::{AdapterError, Invitation, extract_invitation_link, is_error_response};
+use super::bootstrap;
 use super::client::{EVENT_CHANNEL_CAPACITY, EventReceiver};
 use super::commands::{self, ChatKind};
 use super::core::SimplexCore;
@@ -129,48 +127,26 @@ impl NativeSimplexAdapter {
         ))
     }
 
-    /// Point simplex-chat's network config at Secure's own loopback SOCKS bridge and read it
-    /// back to prove the change actually took effect - identical contract to
-    /// [`super::adapter::SimplexAdapter::configure_network`], see that method's docs.
-    pub async fn configure_network(
+    /// Bring the core up over Secure's Tor path: ensure the local user exists, point the network
+    /// config at `socks_address` and verify it, and only then start the chat controller. See
+    /// [`super::bootstrap`] for why that order is a security property - `/_start` before a
+    /// verified `/_network` connects to relays directly. Idempotent: a second call re-verifies
+    /// the network config and `/_start` answers `chatRunning`.
+    pub async fn bootstrap(
         &self,
         socks_address: std::net::SocketAddrV4,
     ) -> Result<(), AdapterError> {
-        self.run(commands::set_network_config(socks_address))
-            .await?;
-        let response = self.run(commands::get_network_config()).await?;
-        let actual = extract_socks_proxy(&response);
-        if actual.as_deref() != Some(commands::socks_proxy_string(socks_address).as_str()) {
-            return Err(AdapterError::NetworkConfigMismatch {
-                expected: socks_address,
-                actual,
-            });
-        }
+        let user_id = bootstrap::bootstrap(socks_address, |cmd| self.run(cmd)).await?;
+        *self.user_id.lock().await = Some(user_id);
         Ok(())
     }
 
-    /// Start the chat controller and read back the active user profile - see
-    /// [`super::adapter::SimplexAdapter::bootstrap`] for why this reads (`ShowActiveUser`)
-    /// rather than creates a user.
-    pub async fn bootstrap(&self) -> Result<(), AdapterError> {
-        match self.run(commands::start_chat()).await {
-            Ok(_) => {}
-            Err(AdapterError::CommandFailed(response)) if is_no_active_user(&response) => {
-                self.run(commands::create_native_user()).await?;
-                self.run(commands::start_chat()).await?;
-            }
-            Err(error) => return Err(error),
-        }
-        let response = match self.run(commands::show_active_user()).await {
-            Ok(response) => response,
-            Err(AdapterError::CommandFailed(response)) if is_no_active_user(&response) => {
-                self.run(commands::create_native_user()).await?
-            }
-            Err(error) => return Err(error),
-        };
-        let user_id = extract_user_id(&response)?;
-        *self.user_id.lock().await = Some(user_id);
-        Ok(())
+    #[cfg(test)]
+    async fn configure_network(
+        &self,
+        socks_address: std::net::SocketAddrV4,
+    ) -> Result<(), AdapterError> {
+        bootstrap::configure_network(socks_address, &mut |cmd| self.run(cmd)).await
     }
 
     /// Create a one-time invitation link for a new contact to connect with.
@@ -230,18 +206,13 @@ impl NativeSimplexAdapter {
     }
 }
 
-fn is_no_active_user(response: &serde_json::Value) -> bool {
-    response
-        .get("error")
-        .and_then(|error| error.get("errorType"))
-        .and_then(|error_type| error_type.get("type"))
-        .and_then(serde_json::Value::as_str)
-        == Some("noActiveUser")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_socks() -> std::net::SocketAddrV4 {
+        "127.0.0.1:9050".parse().expect("address")
+    }
 
     #[tokio::test]
     async fn open_rejects_a_key_containing_a_nul_byte() {
@@ -279,10 +250,13 @@ mod tests {
             .expect_err("must not be able to create an invitation before bootstrap");
         assert!(matches!(error, AdapterError::NotBootstrapped));
 
-        adapter.bootstrap().await.expect("bootstrap");
+        adapter.bootstrap(test_socks()).await.expect("bootstrap");
         // A second bootstrap must not error or create a redundant user - `ShowActiveUser` just
         // reads the same one back again, matching the CLI adapter's own idempotency.
-        adapter.bootstrap().await.expect("bootstrap is idempotent");
+        adapter
+            .bootstrap(test_socks())
+            .await
+            .expect("bootstrap is idempotent");
 
         adapter.shutdown().await;
     }
@@ -296,7 +270,7 @@ mod tests {
         let (adapter, _events) = NativeSimplexAdapter::open(prefix, key)
             .await
             .expect("open the real native store");
-        adapter.bootstrap().await.expect("bootstrap");
+        adapter.bootstrap(test_socks()).await.expect("bootstrap");
 
         let invitation = adapter
             .create_invitation()
@@ -338,8 +312,8 @@ mod tests {
     /// only exists once [`NativeSimplexAdapter::bootstrap`] creates one. `configure_network`
     /// itself requires an active user (confirmed here against the real native core, not
     /// assumed) and fails with `noActiveUser` before one exists. `messaging.rs`'s
-    /// `MessagingRuntime::start` relies on this: it calls `bootstrap` before
-    /// `configure_network` specifically because of this test's finding.
+    /// [`NativeSimplexAdapter::bootstrap`] therefore ensures the user exists first, then
+    /// configures the network, and only then sends `/_start`.
     #[tokio::test]
     async fn configure_network_before_bootstrap_fails_with_no_active_user() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -375,7 +349,7 @@ mod tests {
         let (adapter, _events) = NativeSimplexAdapter::open(prefix, key)
             .await
             .expect("open the real native store");
-        adapter.bootstrap().await.expect("bootstrap");
+        adapter.bootstrap(test_socks()).await.expect("bootstrap");
 
         let addr: std::net::SocketAddrV4 = "127.0.0.1:9050".parse().unwrap();
         adapter

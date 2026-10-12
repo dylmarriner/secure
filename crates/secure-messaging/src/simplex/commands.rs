@@ -44,7 +44,6 @@ pub fn show_active_user() -> String {
 /// creates the profile before the WebSocket API is available. The native core has no equivalent
 /// launch option, so its bootstrap path must create the profile after `/_start` reports
 /// `noActiveUser`.
-#[cfg(feature = "simplex-native")]
 pub fn create_native_user() -> String {
     "/_create user {\"profile\":{\"displayName\":\"Secure\",\"fullName\":\"\"},\"pastTimestamp\":false,\"userChatRelay\":false,\"clientService\":false}".to_owned()
 }

@@ -372,6 +372,7 @@ The production SimpleX store is encrypted with a VMK-derived, domain-separated k
 ## Work
 
 - [x] Configure the SimpleX core network settings to the Secure-owned loopback SOCKS address using upstream `APISetNetworkConfig` (`/_network <json(networkConfig)>`) or the equivalent native API before allowing any user messaging operation.
+      **Correction (2026-10-12):** the native path previously sent `/_start` *before* `/_network`. Upstream `startChatController` resumes the agent and subscribes every existing connection immediately, with the agent's default (no-proxy) config, so a relaunch with existing contacts would have contacted relays directly. `simplex::bootstrap` now enforces user -> `/_network` -> verified read-back -> `/_start`, unit-tested with a fake core in every build (`network_is_configured_and_verified_before_chat_starts`, `chat_is_never_started_when_the_network_read_back_does_not_match`). Still needs the live-core packet-capture proof below.
       `simplex::commands::set_network_config` builds the exact `/_network <json>` payload,
       transcribed field-for-field from `simplexmq` commit `efaad8e73436d60f5052f07dda6b71151ad5039b`
       (the commit `simplex-chat`'s own `cabal.project` pins), not guessed - see that function's
