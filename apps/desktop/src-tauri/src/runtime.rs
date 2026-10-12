@@ -126,7 +126,11 @@ fn remove_prefixed_files(prefix: &Path) {
         return;
     };
     for entry in entries.flatten() {
-        if entry.file_name().to_string_lossy().starts_with(&*file_prefix.to_string_lossy()) {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&*file_prefix.to_string_lossy())
+        {
             let _ = fs::remove_file(entry.path());
         }
     }
@@ -339,24 +343,12 @@ fn status_for(state: AppState) -> AppStatus {
 }
 
 /// Write `bytes` to `path` without ever leaving a partially-written file in place of an
-/// existing one: write to a sibling temp file first, then atomically rename it into place.
+/// existing one, and durably: the temp file is fsynced before the rename and the directory after
+/// it (`docs/security-remediation-plan.md` Phase R1). The vault key envelope is written through
+/// here, and an envelope that is atomically renamed but lost on power failure is an identity
+/// that silently disappears.
 fn write_file_atomically(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "target path has no parent directory",
-        )
-    })?;
-    let mut tmp_path = parent.to_path_buf();
-    let mut file_name = path
-        .file_name()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target path has no file name"))?
-        .to_os_string();
-    file_name.push(".tmp");
-    tmp_path.push(file_name);
-
-    fs::write(&tmp_path, bytes)?;
-    fs::rename(&tmp_path, path)
+    destruction_journal::write_durably(path, bytes)
 }
 
 pub(crate) fn app_status_impl(runtime: &AppRuntime) -> Result<AppStatus, String> {
@@ -508,6 +500,25 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) {
     }
 }
 
+/// Start a new Burn Identity: durably arm the journal, then move the lifecycle to `Destroying`,
+/// then run the sequence. The order is the security property (Phase R1): if the `Armed` record
+/// cannot be persisted, this returns an error with the lifecycle and every file untouched, so a
+/// crash can never leave a half-destroyed identity with no record that a burn was ordered.
+fn begin_identity_burn(lifecycle: &mut AppLifecycle, runtime: &AppRuntime) -> Result<(), String> {
+    destruction_journal::record_stage(&runtime.paths.journal, DestructionStage::Armed).map_err(
+        |error| {
+            format!("could not durably arm the burn journal ({error}) - nothing has been destroyed")
+        },
+    )?;
+    if let Err(error) = lifecycle.apply(AppEvent::BeginIdentityBurn) {
+        // Nothing was destroyed and the lifecycle refused the burn, so the marker just written
+        // must not force one on the next launch.
+        destruction_journal::clear(&runtime.paths.journal);
+        return Err(error.to_string());
+    }
+    destroy_identity_locked(lifecycle, runtime)
+}
+
 /// Drive a Burn Identity (Phase 6) from wherever `lifecycle` currently stands through to the
 /// terminal `Destroyed` state, recording progress durably at every step.
 ///
@@ -531,8 +542,11 @@ fn destroy_identity_locked(
     runtime: &AppRuntime,
 ) -> Result<(), String> {
     // Arm the journal before any work at all. Monotonic, so on a resumed burn this is a no-op
-    // rather than a rewind of the recovered stage.
-    let _ = destruction_journal::record_stage(&runtime.paths.journal, DestructionStage::Armed);
+    // rather than a rewind of the recovered stage. Callers starting a new burn arm it themselves
+    // *before* moving the lifecycle to `Destroying` (see [`begin_identity_burn`]); this repeat is
+    // the guarantee for any other path into this function.
+    destruction_journal::record_stage(&runtime.paths.journal, DestructionStage::Armed)
+        .map_err(|error| format!("could not durably arm the burn journal: {error}"))?;
 
     while let Some(stage) = lifecycle.destruction_stage() {
         let Some(event) = stage.advancing_event() else {
@@ -546,8 +560,19 @@ fn destroy_identity_locked(
             .apply_destruction(event)
             .map_err(|error| error.to_string())?;
 
+        // A failed record aborts the live sequence. The journal still names the earlier stage,
+        // so the next launch re-runs this (idempotent) step and continues forward - continuing
+        // now instead would let later, irreversible steps run with a journal that understates
+        // them by more than one step.
         if let Some(reached) = lifecycle.destruction_stage() {
-            let _ = destruction_journal::record_stage(&runtime.paths.journal, reached);
+            destruction_journal::record_stage(&runtime.paths.journal, reached).map_err(
+                |error| {
+                    format!(
+                        "burn paused: could not durably record progress ({error}); it will resume \
+                     on the next launch"
+                    )
+                },
+            )?;
         }
     }
 
@@ -679,10 +704,7 @@ fn record_failed_unlock_attempt(lifecycle: &mut AppLifecycle, runtime: &AppRunti
     }
 
     // Threshold reached: this is no longer a normal unlock failure, it is the failsafe firing.
-    let begin_result = lifecycle
-        .apply(AppEvent::BeginIdentityBurn)
-        .map_err(|error| error.to_string())
-        .and_then(|()| destroy_identity_locked(lifecycle, runtime));
+    let begin_result = begin_identity_burn(lifecycle, runtime);
 
     match begin_result {
         Ok(()) => format!(
@@ -897,10 +919,7 @@ pub(crate) fn burn_identity_impl(
         state => return Err(format!("cannot burn identity from {state:?}")),
     }
 
-    lifecycle
-        .apply(AppEvent::BeginIdentityBurn)
-        .map_err(|error| error.to_string())?;
-    destroy_identity_locked(&mut lifecycle, runtime)?;
+    begin_identity_burn(&mut lifecycle, runtime)?;
 
     // Destruction is complete and the journal is cleared. Only now is it safe to provision a
     // replacement - see this function's docs for why this cannot be a destruction stage.
@@ -1079,22 +1098,25 @@ pub(crate) async fn start_messaging_impl(runtime: &AppRuntime) -> Result<Messagi
         .await
         .map_err(|error| error.to_string())?;
 
-    let (db_file_prefix, key, sink): (PathBuf, Zeroizing<String>, Arc<dyn crate::messaging::ChatEventSink>) =
-        match context {
-            MessagingContext::Unlocked => (
-                runtime.paths.messaging_prefix.clone(),
-                messaging_key(runtime)?,
-                Arc::new(VaultEventSink(Arc::clone(&runtime.unlocked))),
-            ),
-            // Never `runtime.unlocked`, never `runtime.paths.messaging_prefix` - see this
-            // phase's Ghost checklist: Ghost must never open the normal vault or reuse its
-            // SimpleX database.
-            MessagingContext::Ghost => (
-                runtime.paths.ghost_messaging_prefix.clone(),
-                ghost_messaging_key(runtime)?,
-                Arc::new(GhostEventSink),
-            ),
-        };
+    let (db_file_prefix, key, sink): (
+        PathBuf,
+        Zeroizing<String>,
+        Arc<dyn crate::messaging::ChatEventSink>,
+    ) = match context {
+        MessagingContext::Unlocked => (
+            runtime.paths.messaging_prefix.clone(),
+            messaging_key(runtime)?,
+            Arc::new(VaultEventSink(Arc::clone(&runtime.unlocked))),
+        ),
+        // Never `runtime.unlocked`, never `runtime.paths.messaging_prefix` - see this
+        // phase's Ghost checklist: Ghost must never open the normal vault or reuse its
+        // SimpleX database.
+        MessagingContext::Ghost => (
+            runtime.paths.ghost_messaging_prefix.clone(),
+            ghost_messaging_key(runtime)?,
+            Arc::new(GhostEventSink),
+        ),
+    };
     let started = MessagingRuntime::start(proxy, db_file_prefix, key, sink)
         .await
         .map_err(|MessagingStartError { proxy, error }| {
@@ -1679,6 +1701,111 @@ mod tests {
         ] {
             assert!(!path.exists(), "{} must not survive a burn", path.display());
         }
+    }
+
+    /// The temp-file path `destruction_journal::write_durably` creates before renaming into the
+    /// journal. Occupying it with a directory makes every journal *write* fail while leaving
+    /// reads (and an already-present journal) untouched.
+    fn journal_write_blocker(runtime: &AppRuntime) -> PathBuf {
+        let mut name = runtime
+            .paths
+            .journal
+            .file_name()
+            .expect("name")
+            .to_os_string();
+        name.push(".tmp");
+        runtime.paths.journal.with_file_name(name)
+    }
+
+    #[test]
+    fn burn_refuses_to_start_when_journal_cannot_be_armed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        fs::create_dir(journal_write_blocker(&runtime)).expect("block journal writes");
+
+        let error = burn_identity_impl(None, &runtime).expect_err("arm failure must abort");
+        assert!(error.contains("nothing has been destroyed"), "{error}");
+
+        assert!(
+            runtime.paths.envelope.is_file(),
+            "envelope must be untouched"
+        );
+        assert!(
+            runtime.paths.database.is_file(),
+            "database must be untouched"
+        );
+        assert!(
+            !runtime.paths.journal.exists(),
+            "no journal may have been created"
+        );
+        assert_eq!(app_status_impl(&runtime).expect("status").state, "locked");
+
+        fs::remove_dir(journal_write_blocker(&runtime)).expect("clear fault");
+        unlock_application_impl(PASSPHRASE.to_owned(), &runtime)
+            .expect("the untouched vault still unlocks with its original passphrase");
+    }
+
+    #[test]
+    fn failed_stage_journal_write_is_replayed_after_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        let blocker = journal_write_blocker(&runtime);
+        drop(runtime);
+
+        // Armed normally (the burn was ordered and recorded), then the filesystem starts refusing
+        // writes, so the very first per-stage record fails.
+        destruction_journal::record_stage(
+            &dir.path().join(BURN_JOURNAL_FILE_NAME),
+            DestructionStage::Armed,
+        )
+        .expect("arm");
+        fs::create_dir(&blocker).expect("block journal writes");
+
+        let runtime = runtime_in(dir.path());
+        {
+            let mut lifecycle = runtime.lifecycle.lock().expect("lifecycle");
+            let error = destroy_identity_locked(&mut lifecycle, &runtime)
+                .expect_err("a failed stage record must abort the live sequence");
+            assert!(error.contains("burn paused"), "{error}");
+        }
+        assert_eq!(
+            destruction_journal::read_stage(&runtime.paths.journal),
+            Some(DestructionStage::Armed),
+            "the journal must still name the earlier stage"
+        );
+        assert!(
+            runtime.paths.envelope.is_file(),
+            "aborting before the key-destruction step must not have reached it"
+        );
+        drop(runtime);
+
+        fs::remove_dir(&blocker).expect("clear fault");
+        let restarted = runtime_in(dir.path());
+        assert_eq!(
+            app_status_impl(&restarted).expect("status").state,
+            "destroyed"
+        );
+        assert!(!restarted.paths.envelope.exists());
+        assert!(!restarted.paths.database.exists());
+    }
+
+    #[test]
+    fn durable_envelope_write_round_trips_after_simulated_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        drop(runtime);
+
+        let restarted = runtime_in(dir.path());
+        let mut leftover = restarted.paths.envelope.clone().into_os_string();
+        leftover.push(".tmp");
+        assert!(
+            !PathBuf::from(leftover).exists(),
+            "no temp file may be left behind"
+        );
+        unlock_application_impl(PASSPHRASE.to_owned(), &restarted).expect("unlock after restart");
     }
 
     #[test]
@@ -2282,9 +2409,9 @@ mod tests {
         )
         .expect("write a corrupt store ahead of open");
 
-        let error = start_messaging_impl(&runtime)
-            .await
-            .expect_err("open must fail closed against a corrupt store, not fall back to a fresh one");
+        let error = start_messaging_impl(&runtime).await.expect_err(
+            "open must fail closed against a corrupt store, not fall back to a fresh one",
+        );
         assert!(!error.is_empty());
         assert!(
             runtime.messaging.lock().await.is_none(),

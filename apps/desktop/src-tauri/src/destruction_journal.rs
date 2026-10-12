@@ -141,10 +141,10 @@ pub fn clear(path: &Path) {
 
 /// Write `bytes` to `path` atomically *and* durably: temp file, fsync the temp file's contents,
 /// rename into place, then fsync the containing directory so the rename itself survives a power
-/// loss. [`crate::write_file_atomically`] guarantees only that a reader never sees a torn file;
-/// this additionally guarantees the result is still there after the machine loses power, which
+/// loss. Atomic rename alone guarantees only that a reader never sees a torn file; this
+/// additionally guarantees the result is still there after the machine loses power, which
 /// is the property a destruction journal actually depends on.
-fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_durably(path: &Path, bytes: &[u8]) -> io::Result<()> {
     // Validated up front so a path with no parent fails here rather than half-way through,
     // after a temp file has already been created somewhere unexpected.
     path.parent().ok_or_else(|| {
