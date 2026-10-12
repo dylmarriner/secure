@@ -20,41 +20,43 @@ The repository is pre-release. Do not rely on it for high-risk communication unt
 
 ## Current foundation
 
-Implemented so far (Phases 0-7 of the roadmap are in progress; see `docs/implementation-plan.md`
-for the authoritative, continuously-updated per-phase status - most phases below are real but
-partial, not finished):
+Implemented so far (see `docs/security-remediation-plan.md` for the authoritative per-item status;
+CI's `remediation-gate` fails if a checked item there cites code that does not exist):
 
 - explicit application lifecycle and destruction-order state machine (`secure-core`);
 - random 256-bit vault master key generation, Argon2id passphrase-derived wrapping key,
   versioned authenticated `SVK1` vault-key envelope, XChaCha20-Poly1305 local key wrapping,
-  HKDF-SHA-256 domain-separated database/config subkeys, zeroising and (for the vault master
-  key specifically) memory-locked key buffers (`secure-crypto`);
+  HKDF-SHA-256 domain-separated database/config/messaging subkeys, zeroising and (for the vault
+  master key specifically) memory-locked key buffers (`secure-crypto`);
 - SQLCipher-backed encrypted vault persistence with versioned schema migrations and
-  crash-consistent Burn Conversation (`secure-storage`);
-- managed Tor transport embedding Arti, with a fail-closed, network-free-testable state machine
-  (`secure-transport`);
-- a first-slice SimpleX messaging adapter behind a protocol-neutral boundary - bootstrap,
-  invitations, plain-text messages, typed chat events - not yet wired into the desktop host
-  (`secure-messaging`);
-- independent per-attachment encryption keys and bounded-memory authenticated streaming
-  encryption, not yet wired into a real ingest path (`secure-attachments`);
-- a Tauri 2 desktop host wiring the above into real onboarding/unlock/lock, Tor start/stop,
-  crash-consistent Burn Identity, brute-force lockout, replacement-identity primitives, and
-  Ghost Session flows, with a local-only static frontend, restrictive CSP, and no direct
-  frontend network functionality;
-- CI format/test/clippy gates on Linux and Windows.
+  crash-consistent Burn Conversation, including a durable queue of attachment ciphertext to
+  delete after their keys are destroyed (`secure-storage`);
+- managed Tor transport embedding Arti, with a fail-closed lifecycle and a loopback SOCKS5
+  bridge that isolates circuits per SOCKS credential and whose shutdown cannot be stalled by a
+  silent client (`secure-transport`);
+- a SimpleX messaging adapter behind a protocol-neutral boundary: a production native-core path
+  (`simplex-native` feature, key passed in memory, network configured and verified *before* the
+  chat starts, per-connection circuit isolation) and a dev-only CLI harness; bounded command
+  correlation, WebSocket size limits and validated contact links (`secure-messaging`);
+- per-attachment random keys, bounded-memory authenticated streaming encryption, an opaque
+  on-disk object store and transactional (authenticate-then-publish) plaintext export
+  (`secure-attachments`);
+- a Tauri 2 desktop host wiring the above into onboarding/unlock/lock, Tor start/stop,
+  messaging start behind the native feature, crash-consistent Burn Identity that fails closed if
+  its journal cannot be written, brute-force lockout, replacement-identity primitives, Ghost
+  Session, and post-burn cleanup of the SimpleX store and attachment objects; a local-only static
+  frontend with a restrictive CSP and no direct frontend network functionality;
+- CI on Linux and Windows: format, tests (core and desktop), clippy in both feature modes,
+  cargo-deny, a CycloneDX SBOM and release metadata, with every action pinned to a commit SHA.
 
-The current replacement-identity implementation is transitional: the product requirement is now the mandatory automatic flow defined in `docs/self-destruct-semantics.md`, and the implementation must be brought into exact alignment before production release.
+Not yet implemented/completed (all release blockers - see `docs/release-checklist.md`):
 
-Not yet implemented/completed:
-
-- full mandatory automatic post-Burn replacement semantics and device-bound anti-rollback enforcement defined in `docs/self-destruct-semantics.md` and `docs/backup-snapshot-hardening.md`;
-- `secure-messaging` wired into the desktop host through the fully verified fail-closed Tor path;
-- `secure-attachments` wired into a real ingest path, and on-disk ciphertext cleanup integrated
-  with burn (attachment *key* destruction at the database level is already part of Burn
-  Conversation);
-- Ghost Session's messaging-layer scope (memory-backed protocol state, disabling durable
-  drafts/contact aliases) - not yet applicable until messaging is wired into the host.
+- device-bound anti-rollback enforcement (`docs/backup-snapshot-hardening.md`) and the fully
+  automatic post-Burn replacement semantics (`docs/self-destruct-semantics.md`);
+- live two-client SimpleX-over-Tor verification, kill-the-bridge and packet-capture evidence
+  (these need the native core built from source and dedicated hosts);
+- SimpleX attachment transport and any UI for conversations or attachments;
+- real-hardware Windows/Linux validation and an independent security review.
 
 Those components will be added only as real tested slices rather than decorative placeholders.
 
@@ -86,21 +88,34 @@ docs/implementation-plan.md          phased implementation roadmap
 docs/security-remediation-plan.md    active remediation roadmap
 docs/self-destruct-semantics.md      mandatory Burn / automatic replacement semantics
 docs/backup-snapshot-hardening.md    mandatory snapshot/rollback resistance requirements
+docs/release-checklist.md            what must be true before any release or security claim
 docs/licensing.md                    messaging licensing decision (AGPLv3 client)
 ```
 
 ## Core checks
 
+These are what CI runs; run them before pushing.
+
 ```bash
 cargo fmt --all -- --check
-cargo test --workspace --all-targets
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --locked --workspace --all-targets
+# --all-features includes `simplex-native`; check-only mode lints it without the native library.
+SECURE_SIMPLEX_NATIVE_CHECK_ONLY=1 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+python3 scripts/check-plan-claims.py
 ```
 
-Desktop host compile check on Linux:
+Desktop host (Linux needs the Tauri system packages listed in `.github/workflows/ci.yml`):
 
 ```bash
-cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+cargo test --locked --manifest-path apps/desktop/src-tauri/Cargo.toml
+cargo clippy --locked --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
+```
+
+Supply chain (with `cargo-deny` installed):
+
+```bash
+cargo deny --manifest-path Cargo.toml --config deny.toml check
+cargo deny --manifest-path apps/desktop/src-tauri/Cargo.toml --config deny.toml check
 ```
 
 See `docs/security-architecture.md` for the threat model, `docs/implementation-plan.md` for the execution sequence, and the mandatory destruction documents above for the release-blocking Self-Destruct invariants.

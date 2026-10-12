@@ -56,10 +56,11 @@ The following findings remain active and are ordered below by remediation depend
 ## Work
 
 - [x] Add a prominent link from the implementation plan and README to this remediation plan.
-      (README already linked it; added the same link plus a blocked-wiring note to
-      `docs/implementation-plan.md`.)
+      (README already linked it. Corrected 2026-10-12: the implementation-plan link and
+      blocked-wiring note this item claimed had not actually been added; they are now at the top
+      of `docs/implementation-plan.md`.)
 - [x] Mark host-level messaging wiring as blocked until Phases R1-R4 are complete
-      (`docs/implementation-plan.md`, top-of-file note and Phase 6 burn-sequence step 2).
+      (`docs/implementation-plan.md` top-of-file note, added 2026-10-12).
 - [x] Reconcile stale architecture text that still describes the SimpleX licensing choice as
       unresolved. Checked `docs/security-architecture.md` and `docs/implementation-plan.md`
       Phase 3: both already state the licensing gate is resolved (AGPLv3-compatible); no stale
@@ -779,16 +780,16 @@ Malformed local/upstream input cannot grow unbounded adapter state, create an ex
 
 ## Work
 
-- [ ] Protect `main` against direct unreviewed pushes once the current rapid-foundation stage ends.
-- [ ] Require Linux Rust, Windows Rust, Linux Tauri, and Windows Tauri checks before merge.
-- [ ] Add a required remediation/security test job covering R1-R7 network-free tests.
-- [ ] Add an opt-in/nightly trusted integration job for live Tor + real SimpleX tests; never expose secrets to forked PRs.
-- [ ] Add dependency/license vulnerability policy (`cargo deny` or equivalent) with an explicit review process for exceptions.
-- [ ] Generate an SBOM and record exact SimpleX/Arti/SQLCipher versions for release artifacts.
-- [ ] Pin or deliberately review GitHub Actions dependencies instead of treating CI supply chain as magically trustworthy.
-- [ ] Reconcile README stale statements about what has/has not been empirically exercised.
-- [ ] Reconcile `docs/security-architecture.md` with the resolved AGPL decision and actual Arti SOCKS bridge.
-- [ ] Add a release checklist stating which claims are allowed only after R9.
+- [ ] Protect `main` against direct unreviewed pushes once the current rapid-foundation stage ends. Repository-settings change for the owner; exact ruleset listed in `docs/release-checklist.md` section 2.
+- [ ] Require Linux Rust, Windows Rust, Linux Tauri, and Windows Tauri checks before merge. The checks exist and now run the desktop *tests*, not just `cargo check`; marking them required is the same owner-only settings change.
+- [x] Add a required remediation/security test job covering R1-R7 network-free tests. (`remediation-gate` depends on every test job and runs `scripts/check-plan-claims.py`, which fails if a checked item here cites an identifier that is not in the sources.)
+- [x] Add an opt-in/nightly trusted integration job for live Tor + real SimpleX tests; never expose secrets to forked PRs. (`.github/workflows/integration-security.yml`: dispatch/weekly only, no secrets, never on PRs. Covers live Tor; real SimpleX needs the native core build - see that file.)
+- [x] Add dependency/license vulnerability policy (`cargo deny` or equivalent) with an explicit review process for exceptions. (`deny.toml`, run on both lockfiles in CI; each exception carries a reason. Its first run found RUSTSEC-2026-0285 in rustls, now updated.)
+- [x] Generate an SBOM and record exact SimpleX/Arti/SQLCipher versions for release artifacts. (CycloneDX SBOM + `scripts/release-metadata.py`, uploaded as the `release-evidence` CI artifact.)
+- [x] Pin or deliberately review GitHub Actions dependencies instead of treating CI supply chain as magically trustworthy. (All actions pinned to commit SHAs; `persist-credentials: false`.)
+- [x] Reconcile README stale statements about what has/has not been empirically exercised.
+- [x] Reconcile `docs/security-architecture.md` with the resolved AGPL decision and actual Arti SOCKS bridge. (AGPL text was already current; the bridge's isolation scope is documented in `secure-transport/src/socks.rs` and R4.)
+- [x] Add a release checklist stating which claims are allowed only after R9. (`docs/release-checklist.md`.)
 
 ## Required repository checks
 
