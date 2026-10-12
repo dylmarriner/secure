@@ -271,7 +271,14 @@ impl NetworkConfig {
             socks_mode: "always",
             host_mode: "public",
             required_host_mode: true,
-            session_mode: "user",
+            // `entity`, not upstream's app default: simplexmq's `clientSocksCredentials` (pinned
+            // commit) derives the SOCKS username from the session mode, and with no auth prefix
+            // (`SocksIsolateByAuth`) that username is what `TorSocksProxy`'s per-credential
+            // isolation keys circuits on. `user` hashes only the user id - every relay
+            // connection shares one circuit; `entity` adds the server and connection id, so each
+            // contact's connection gets its own. Costs more TCP sessions/circuits; for a
+            // security-first client unlinkability across contacts is worth that.
+            session_mode: "entity",
             smp_proxy_mode: "always",
             smp_proxy_fallback: "allowProtected",
             smp_web_port_servers: "preset",
@@ -440,6 +447,17 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(json_part).expect("payload must be valid JSON");
         assert_eq!(payload["socksProxy"], "127.0.0.1:9999");
+    }
+
+    #[test]
+    fn set_network_config_isolates_circuits_per_connection() {
+        let address: SocketAddrV4 = "127.0.0.1:9999".parse().expect("valid address");
+        let command = set_network_config(address);
+        let payload: serde_json::Value =
+            serde_json::from_str(command.strip_prefix("/_network ").expect("prefix"))
+                .expect("payload must be valid JSON");
+        assert_eq!(payload["sessionMode"], "entity");
+        assert_eq!(payload["socksMode"], "always");
     }
 
     #[test]

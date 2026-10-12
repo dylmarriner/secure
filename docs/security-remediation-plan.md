@@ -391,6 +391,7 @@ The production SimpleX store is encrypted with a VMK-derived, domain-separated k
       blocker as above - deferred to R5's runtime, which is what will own both lifecycles to
       react to one from the other.
 - [x] Add circuit isolation at the narrowest practical relationship boundary supported by the Arti/SOCKS/SimpleX combination; document exactly what is and is not isolated.
+      **Correction (2026-10-12):** the network config sent `sessionMode: "user"`, for which simplexmq's `clientSocksCredentials` derives one SOCKS username per *user* - every relay connection shared one circuit, so the per-credential isolation below never separated contacts. It now sends `entity` (server + connection id in the credentials), pinned by `set_network_config_isolates_circuits_per_connection`.
       `secure_transport::socks::ConnectionIsolation` keys each proxied connection's
       `arti_client::StreamPrefs` isolation off the SOCKS5 username/password the connecting client
       presented (verified against `tor-socksproto` 0.46's real `SocksAuth`/server handshake

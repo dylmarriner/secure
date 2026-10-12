@@ -1106,6 +1106,20 @@ impl crate::messaging::ChatEventSink for GhostEventSink {
     fn record(&self, _event: secure_messaging::ChatEvent) {}
 }
 
+/// Lower-hex encode key material into one exact-capacity, zeroizing buffer. Formatting each byte
+/// through `format!` (as an earlier version did) leaves short-lived un-wiped copies of the key on
+/// the heap, and a growing `String` can reallocate and leave another.
+#[cfg(any(test, feature = "simplex-native"))]
+fn hex_key(key: &[u8]) -> Zeroizing<String> {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Zeroizing::new(String::with_capacity(key.len() * 2));
+    for byte in key {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
 #[cfg(feature = "simplex-native")]
 fn messaging_key(runtime: &AppRuntime) -> Result<Zeroizing<String>, String> {
     let unlocked = runtime
@@ -1119,9 +1133,7 @@ fn messaging_key(runtime: &AppRuntime) -> Result<Zeroizing<String>, String> {
         .key
         .derive_subkey(secure_crypto::SubkeyPurpose::MessagingDatabaseV1)
         .map_err(|_| "failed to derive messaging database key".to_owned())?;
-    Ok(Zeroizing::new(
-        key.iter().map(|byte| format!("{byte:02x}")).collect(),
-    ))
+    Ok(hex_key(key.as_slice()))
 }
 
 /// Same derivation as [`messaging_key`], off the Ghost session's own random key instead of the
@@ -1140,9 +1152,7 @@ fn ghost_messaging_key(runtime: &AppRuntime) -> Result<Zeroizing<String>, String
         .key
         .derive_subkey(secure_crypto::SubkeyPurpose::MessagingDatabaseV1)
         .map_err(|_| "failed to derive Ghost messaging database key".to_owned())?;
-    Ok(Zeroizing::new(
-        key.iter().map(|byte| format!("{byte:02x}")).collect(),
-    ))
+    Ok(hex_key(key.as_slice()))
 }
 
 /// Which lifecycle state `start_messaging_impl` was called from - determines which vault (if
@@ -1993,6 +2003,18 @@ mod tests {
             original.state(),
             TransportState::Stopped,
             "the stopped instance itself is never revived"
+        );
+    }
+
+    #[test]
+    fn hex_key_matches_lower_hex_and_never_reallocates() {
+        let key = [0x00_u8, 0x0f, 0xa5, 0xff];
+        let encoded = hex_key(&key);
+        assert_eq!(encoded.as_str(), "000fa5ff");
+        assert_eq!(
+            encoded.capacity(),
+            key.len() * 2,
+            "exact capacity: no reallocation copies"
         );
     }
 

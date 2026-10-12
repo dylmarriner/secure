@@ -27,9 +27,12 @@ pub enum AdapterError {
     #[cfg(feature = "simplex-native")]
     #[error(transparent)]
     Core(#[from] super::core::CoreError),
-    #[error("simplex-chat rejected the command: {0}")]
+    // Display deliberately shows only upstream's error *type* tag, never the response JSON:
+    // these strings reach the WebView through Tauri command errors, and full responses can carry
+    // contact names, links and message content. The value stays available to Rust callers.
+    #[error("the messaging core rejected the command ({})", error_kind(.0))]
     CommandFailed(serde_json::Value),
-    #[error("unexpected response shape from simplex-chat: {0}")]
+    #[error("unexpected response from the messaging core ({})", response_kind(.0))]
     UnexpectedResponse(serde_json::Value),
     #[error("bootstrap must complete before this operation")]
     NotBootstrapped,
@@ -183,6 +186,30 @@ impl SimplexAdapter {
     }
 }
 
+/// Upstream's machine-readable error tag (e.g. `noActiveUser`) from an error response, or
+/// `unknown`. Only short identifier-like tags are returned, so nothing else can leak through.
+fn error_kind(response: &serde_json::Value) -> &str {
+    let tag = ["error", "chatError"]
+        .iter()
+        .find_map(|field| response.get(field))
+        .and_then(|error| error.get("errorType").or(Some(error)))
+        .and_then(|error| error.get("type"))
+        .and_then(serde_json::Value::as_str);
+    identifier_or_unknown(tag)
+}
+
+/// The response's top-level `type` tag, or `unknown`.
+fn response_kind(response: &serde_json::Value) -> &str {
+    identifier_or_unknown(response.get("type").and_then(serde_json::Value::as_str))
+}
+
+fn identifier_or_unknown(tag: Option<&str>) -> &str {
+    match tag {
+        Some(tag) if tag.len() <= 64 && tag.bytes().all(|b| b.is_ascii_alphanumeric()) => tag,
+        _ => "unknown",
+    }
+}
+
 pub(super) fn is_error_response(response: &serde_json::Value) -> bool {
     matches!(
         response.get("type").and_then(serde_json::Value::as_str),
@@ -241,6 +268,36 @@ mod tests {
             "error": {"errorType": {"type": "noActiveUser"}}
         });
         assert!(is_error_response(&response));
+    }
+
+    #[test]
+    fn error_display_never_includes_response_content() {
+        let response = serde_json::json!({
+            "type": "chatCmdError",
+            "chatError": {"type": "error", "errorType": {"type": "noActiveUser"}},
+            "contact": {"localDisplayName": "SECRET-CONTACT-NAME"}
+        });
+        let shown = AdapterError::CommandFailed(response).to_string();
+        assert!(shown.contains("noActiveUser"), "{shown}");
+        assert!(!shown.contains("SECRET"), "{shown}");
+
+        let shown = AdapterError::UnexpectedResponse(serde_json::json!({
+            "type": "newChatItems", "text": "SECRET message body"
+        }))
+        .to_string();
+        assert!(
+            shown.contains("newChatItems") && !shown.contains("SECRET"),
+            "{shown}"
+        );
+
+        let shown = AdapterError::UnexpectedResponse(serde_json::json!({
+            "type": "has spaces SECRET"
+        }))
+        .to_string();
+        assert!(
+            shown.contains("unknown") && !shown.contains("SECRET"),
+            "{shown}"
+        );
     }
 
     #[test]
