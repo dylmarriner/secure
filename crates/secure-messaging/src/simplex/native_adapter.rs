@@ -66,6 +66,7 @@ pub struct NativeSimplexAdapter {
     /// held across an `.await`, so it cannot block the async runtime.
     core: Arc<std::sync::Mutex<SimplexCore>>,
     user_id: AsyncMutex<Option<i64>>,
+    event_tx: mpsc::UnboundedSender<serde_json::Value>,
     stop_events: Arc<AtomicBool>,
     event_task: tokio::task::JoinHandle<()>,
 }
@@ -88,6 +89,7 @@ impl NativeSimplexAdapter {
 
         let poll_core = Arc::clone(&core);
         let poll_stop = Arc::clone(&stop_events);
+        let poll_event_tx = event_tx.clone();
         let event_task = tokio::spawn(async move {
             loop {
                 if poll_stop.load(Ordering::Relaxed) {
@@ -107,7 +109,8 @@ impl NativeSimplexAdapter {
                         // The only failure mode is "no receiver left", meaning the adapter has
                         // already been dropped without going through `shutdown` - nothing to do
                         // but stop polling, matching `client.rs`'s reader task.
-                        if event_tx.send(value).is_err() {
+                    let event = value.get("result").cloned().unwrap_or(value);
+                    if poll_event_tx.send(event).is_err() {
                             break;
                         }
                     }
@@ -122,6 +125,7 @@ impl NativeSimplexAdapter {
             Self {
                 core,
                 user_id: AsyncMutex::new(None),
+                event_tx,
                 stop_events,
                 event_task,
             },
@@ -182,9 +186,29 @@ impl NativeSimplexAdapter {
 
     /// Accept an invitation (or connect to a contact address / group link).
     pub async fn accept_invitation(&self, link: &str) -> Result<(), AdapterError> {
+        self.accept_invitation_with_contact_id(link).await.map(|_| ())
+    }
+
+    pub async fn accept_invitation_with_contact_id(
+        &self,
+        link: &str,
+    ) -> Result<Option<i64>, AdapterError> {
         let user_id = self.require_user_id().await?;
-        self.run(commands::connect_via_link(user_id, link)).await?;
-        Ok(())
+        // Native `connect` may return the connection event as the command response rather than
+        // through `chat_recv_msg_wait`. Preserve it on the same event channel so callers have one
+        // event contract regardless of which side of the invitation produced the event.
+        let response = self.run(commands::connect_via_link(user_id, link)).await?;
+        let contact_id = response
+            .get("contact")
+            .and_then(|contact| contact.get("contactId"))
+            .and_then(serde_json::Value::as_i64);
+        if matches!(
+            response.get("type").and_then(serde_json::Value::as_str),
+            Some("contactConnecting") | Some("contactConnected")
+        ) {
+            let _ = self.event_tx.send(response);
+        }
+        Ok(contact_id)
     }
 
     /// Send a plain-text message to a direct chat.
