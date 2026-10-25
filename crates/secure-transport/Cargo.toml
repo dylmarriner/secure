@@ -17,7 +17,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "sync"] }
 tor-socksproto = "0.46"
-tor-rtcompat = { version = "0.46", features = ["tokio", "rustls"] }
+tor-rtcompat = { version = "0.47", features = ["tokio", "rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
