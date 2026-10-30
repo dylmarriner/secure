@@ -13,7 +13,7 @@ exclude = ["apps/desktop/src-tauri", "fuzz"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
