@@ -586,10 +586,18 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) -> Re
         // step reports failure so the burn pauses before this stage is journalled and retries it
         // on the next launch instead of claiming a completeness it does not have.
         DestructionEvent::PersistentKeyAccessDestroyed => {
-            let device_result = match read_device_locator(&runtime.paths.device_locator) {
-                Some(locator) => runtime.device.destroy(&locator),
-                None => Ok(()),
-            };
+            // The locator is the only link between this identity and its TPM NV index.
+            // A missing/corrupt locator is NOT proof that the old secret was destroyed:
+            // a pre-burn snapshot may contain the correct locator and envelope, so treating
+            // this as success would let that snapshot resurrect the supposedly burned identity.
+            // Leave the durable burn journal armed and retry only after the binding can be
+            // recovered. Never report completion or provision a replacement in this state.
+            let locator = read_device_locator(&runtime.paths.device_locator).ok_or_else(|| {
+                "burn paused: device-bound locator is missing or corrupt; cannot prove \
+                 the old hardware secret was revoked"
+                    .to_owned()
+            })?;
+            let device_result = runtime.device.destroy(&locator);
             shred_file_best_effort(&runtime.paths.envelope);
             device_result.map_err(|error| {
                 format!(
