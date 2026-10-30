@@ -2248,6 +2248,51 @@ mod tests {
     }
 
     #[test]
+    fn burn_must_not_complete_when_device_locator_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = simulated_tpm(dir.path());
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        let old_locator = read_device_locator(&runtime.paths.device_locator).expect("locator");
+        fs::remove_file(&runtime.paths.device_locator).expect("simulate lost locator");
+
+        let error = burn_identity_impl(None, &runtime)
+            .expect_err("burn cannot prove revocation without its device locator");
+        assert!(error.contains("device-bound locator"), "{error}");
+        assert_eq!(
+            device.live_secrets(),
+            1,
+            "the original TPM secret remains and a pre-burn snapshot could still unlock"
+        );
+        assert!(device.read(&old_locator).is_ok());
+        assert_eq!(
+            destruction_journal::read_stage(&runtime.paths.journal),
+            Some(DestructionStage::RuntimeSecretsRevoked),
+            "do not journal the irreversible boundary as complete"
+        );
+    }
+
+    #[test]
+    fn burn_must_not_complete_when_device_locator_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = simulated_tpm(dir.path());
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        fs::write(&runtime.paths.device_locator, b"invalid-locator")
+            .expect("simulate corrupt locator");
+
+        let error = burn_identity_impl(None, &runtime)
+            .expect_err("burn cannot prove revocation with a corrupt device locator");
+        assert!(error.contains("device-bound locator"), "{error}");
+        assert_eq!(device.live_secrets(), 1);
+        assert_eq!(
+            destruction_journal::read_stage(&runtime.paths.journal),
+            Some(DestructionStage::RuntimeSecretsRevoked),
+            "the next launch must not return to ordinary unlocking"
+        );
+    }
+
+    #[test]
     fn no_identity_is_created_without_device_bound_storage() {
         let dir = tempfile::tempdir().expect("tempdir");
         let runtime = runtime_with_device(
