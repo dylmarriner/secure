@@ -140,7 +140,9 @@ jobs:
       - name: TPM tests
         env:
           SECURE_TPM_TCTI: swtpm:host=127.0.0.1,port=2321
-        run: cargo test --locked -p secure-device --features tpm -- --include-ignored
+        # The four integration cases share one swtpm NV namespace; parallel tests race
+        # over NV index enumeration/definition and cause intermittent invalid-handle errors.
+        run: cargo test --locked -p secure-device --features tpm -- --include-ignored --test-threads=1
 
   supply-chain:
     name: Supply chain (cargo-deny, SBOM, release metadata)
