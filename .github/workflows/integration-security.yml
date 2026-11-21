@@ -1,15 +1,20 @@
 name: Integration security (live Tor)
 
-# Live-network tests that cannot run on every PR: they bootstrap against the real Tor network.
-# Trusted triggers only - manual dispatch and a weekly schedule on the default branch. This
-# workflow never runs for pull requests (so forked code never executes here) and uses no
-# repository secrets. docs/security-remediation-plan.md R8.
+# Live-network tests run only on trusted manual/scheduled triggers, never on PRs.
+# PRs that modify security parsers or this workflow get a short no-network fuzz smoke test;
+# weekly/manual runs keep the full 15-minute fuzz duration. No repository secrets are used.
+# docs/security-remediation-plan.md R8.
 #
 # Not covered here yet: the SimpleX two-client round trip and kill-the-SOCKS-bridge tests need
 # the simplex-native core built from source (scripts/build-simplex-native.sh, GHC 9.6 + cabal,
 # ~1h) and packet capture needs a dedicated host; see R4/R9.
 
 on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - ".github/workflows/integration-security.yml"
   workflow_dispatch:
   schedule:
     - cron: "17 3 * * 1"
@@ -20,6 +25,7 @@ permissions:
 jobs:
   live-tor:
     name: Live Tor bootstrap and SOCKS shutdown
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -51,9 +57,14 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-fuzz@0.13.2
-      - name: Fuzz for 15 minutes
+      - name: Install sanitizer-compatible GNU target
+        run: rustup target add x86_64-unknown-linux-gnu --toolchain nightly
+      - name: Fuzz parsers (30s smoke on PR, 15m on scheduled/manual runs)
         working-directory: fuzz
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=900
+        env:
+          FUZZ_SECONDS: ${{ github.event_name == 'pull_request' && '30' || '900' }}
+        # Explicitly avoid the musl target: address sanitizer cannot link against static libc.
+        run: cargo +nightly fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time="$FUZZ_SECONDS"
       - name: Keep any crashing input
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
