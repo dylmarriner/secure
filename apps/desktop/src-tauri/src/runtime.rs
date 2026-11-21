@@ -586,10 +586,18 @@ fn perform_destruction_step(event: DestructionEvent, runtime: &AppRuntime) -> Re
         // step reports failure so the burn pauses before this stage is journalled and retries it
         // on the next launch instead of claiming a completeness it does not have.
         DestructionEvent::PersistentKeyAccessDestroyed => {
-            let device_result = match read_device_locator(&runtime.paths.device_locator) {
-                Some(locator) => runtime.device.destroy(&locator),
-                None => Ok(()),
-            };
+            // The locator is the only link between this identity and its TPM NV index.
+            // A missing/corrupt locator is NOT proof that the old secret was destroyed:
+            // a pre-burn snapshot may contain the correct locator and envelope, so treating
+            // this as success would let that snapshot resurrect the supposedly burned identity.
+            // Leave the durable burn journal armed and retry only after the binding can be
+            // recovered. Never report completion or provision a replacement in this state.
+            let locator = read_device_locator(&runtime.paths.device_locator).ok_or_else(|| {
+                "burn paused: device-bound locator is missing or corrupt; cannot prove \
+                 the old hardware secret was revoked"
+                    .to_owned()
+            })?;
+            let device_result = runtime.device.destroy(&locator);
             shred_file_best_effort(&runtime.paths.envelope);
             device_result.map_err(|error| {
                 format!(
@@ -2244,6 +2252,51 @@ mod tests {
             read_failed_attempts(&restored.paths.attempts),
             0,
             "a destroyed identity is not a wrong passphrase and must not count toward the wipe"
+        );
+    }
+
+    #[test]
+    fn burn_must_not_complete_when_device_locator_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = simulated_tpm(dir.path());
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        let old_locator = read_device_locator(&runtime.paths.device_locator).expect("locator");
+        fs::remove_file(&runtime.paths.device_locator).expect("simulate lost locator");
+
+        let error = burn_identity_impl(None, &runtime)
+            .expect_err("burn cannot prove revocation without its device locator");
+        assert!(error.contains("device-bound locator"), "{error}");
+        assert_eq!(
+            device.live_secrets(),
+            1,
+            "the original TPM secret remains and a pre-burn snapshot could still unlock"
+        );
+        assert!(device.read(&old_locator).is_ok());
+        assert_eq!(
+            destruction_journal::read_stage(&runtime.paths.journal),
+            Some(DestructionStage::RuntimeSecretsRevoked),
+            "do not journal the irreversible boundary as complete"
+        );
+    }
+
+    #[test]
+    fn burn_must_not_complete_when_device_locator_is_corrupt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let device = simulated_tpm(dir.path());
+        let runtime = runtime_in(dir.path());
+        complete_onboarding_impl(PASSPHRASE.to_owned(), &runtime).expect("onboarding");
+        fs::write(&runtime.paths.device_locator, b"invalid-locator")
+            .expect("simulate corrupt locator");
+
+        let error = burn_identity_impl(None, &runtime)
+            .expect_err("burn cannot prove revocation with a corrupt device locator");
+        assert!(error.contains("device-bound locator"), "{error}");
+        assert_eq!(device.live_secrets(), 1);
+        assert_eq!(
+            destruction_journal::read_stage(&runtime.paths.journal),
+            Some(DestructionStage::RuntimeSecretsRevoked),
+            "the next launch must not return to ordinary unlocking"
         );
     }
 
